@@ -1,0 +1,5 @@
+strategy:
+  type: toy_rebalance
+  rebalance_every_minutes: 60
+  target_count: 3
+  max_gross_leverage: 1.0

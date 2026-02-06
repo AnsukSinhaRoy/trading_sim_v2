@@ -1,0 +1,16 @@
+market_feed:
+  type: matrix_store_1m
+
+  # IMPORTANT: point to the cube store root
+  store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store"
+
+  # Pick a window (start/end must fall on available dates)
+  start: "2015-02-02 09:15:00"
+  end:   "2024-01-01 15:30:00"
+
+  # How fast to replay
+  # fast = no sleeping, real_time = sleeps to match clock, step = manual stepping (if supported)
+  speed: fast
+
+  # Optional: if supported by your feed, you can restrict symbols
+  # symbols: ["reliance", "tcs"]

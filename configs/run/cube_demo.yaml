@@ -1,0 +1,13 @@
+run:
+  name: demo_cube_store
+  out_dir: runs
+  seed: 7
+  log_level: INFO
+  progress_every_ticks: 250
+
+modules:
+  # This feed will read close.parquet inside the cube store's date partitions
+  market_feed: ../market_feed/cube_feed.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/xs_mom_vol_target.yaml
+  ui:          ../ui/live_dashboard.yaml

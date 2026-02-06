@@ -1,0 +1,20 @@
+task: preprocess
+
+preprocess:
+  dataset_name: nifty500
+  out_dir: "processed_data"
+
+  # Reuse existing long store; do NOT rebuild CSV -> long store
+  long_store_dir: "processed_data/nifty500/1m_long_store"
+  mode: cube
+
+  # Which fields to materialize into the cube store
+  fields: ["open", "high", "low", "close", "volume"]
+
+  market_start: "09:15:00"
+  market_end: "15:30:00"
+  freq: "1min"
+
+  progress_every_days: 10
+  cleanup_long_store: false
+  log_level: INFO

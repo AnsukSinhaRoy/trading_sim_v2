@@ -1,0 +1,60 @@
+# Build a reusable 1-minute OHLCV cube store (daily matrices, parquet).
+# Run:
+#   python -m preprocess --config configs/preprocess/nifty500_1m_store.yaml
+
+task: preprocess
+
+preprocess:
+  dataset_name: nifty500
+  
+
+  # Raw minute CSV folder (contains files like reliance_minute.csv)
+  raw_dir: "E:/data_1m"
+
+  # Output root
+  out_dir: "processed_data"
+
+  # File discovery
+  glob: "*.csv"
+  recursive: true
+  symbol_regex: "^(?P<symbol>.+)_minute\\.csv$"
+
+  # Columns in raw CSV
+  timestamp_col: "date"
+
+  # Which fields to store (canonical names)
+  fields: ["open", "high", "low", "close", "volume"]
+
+  # Map canonical fields -> your CSV column names (edit only if your headers differ)
+  ohlcv_cols:
+    open: "open"
+    high: "high"
+    low: "low"
+    close: "close"
+    volume: "volume"
+
+  # Market hours
+  market_start: "09:15:00"
+  market_end: "15:30:00"
+  freq: "1min"
+
+  # Optional: restrict range for a first small test
+  # start: "2024-01-01 00:00:00"
+  # end:   "2024-01-05 23:59:59"
+
+  # Universe filter (optional). Leave null to autodetect all files present.
+  universe_file: null
+
+  # Build mode:
+  # - cube: long_store -> cube_store
+  mode: cube
+
+  # Performance knobs
+  chunksize: 750000
+  progress_every_days: 10
+  strict_fields: true
+
+  # If true, deletes the intermediate long store after building cube store
+  cleanup_long_store: false
+
+  log_level: INFO

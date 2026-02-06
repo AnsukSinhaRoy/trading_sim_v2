@@ -1,0 +1,15 @@
+strategy:
+
+  type: "strategy.xs_mom_vol_target:XSMomVolTargetStrategy"
+
+  rebalance_every_minutes: 60
+  target_count: 10
+  signal_lookback_mins: 120
+  vol_lookback_mins: 120
+  max_gross_leverage: 1.0
+  cash_buffer: 0.05
+  max_weight: 0.12
+  max_turnover: 0.60
+  min_signal: 0.0
+  reset_on_new_day: true
+  drawdown_stop: 0.25

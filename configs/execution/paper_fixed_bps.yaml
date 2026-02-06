@@ -1,0 +1,8 @@
+execution:
+  initial_cash: 1000000
+  slippage:
+    model: fixed_bps
+    bps: 3
+  fees:
+    model: fixed_bps
+    bps: 1

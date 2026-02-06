@@ -1,0 +1,10 @@
+run:
+  name: demo_synth
+  out_dir: runs
+  seed: 7
+
+modules:
+  market_feed: ../market_feed/synth_1m.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/toy_rebalance.yaml
+  ui:          ../ui/live_dashboard.yaml
