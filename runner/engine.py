@@ -1,21 +1,83 @@
 from __future__ import annotations
+import asyncio
 from pathlib import Path
-from typing import Dict, List
-import uuid, math, csv
+from typing import Dict, List, Any, TYPE_CHECKING
+from datetime import datetime, date
+from decimal import Decimal
+import uuid, math, csv, json
+import importlib
 
+# ZMQ for Real-Time Dashboard (Qt)
+#
+# NOTE (Windows): zmq.asyncio + ProactorEventLoop can be unreliable on some setups.
+# We publish using a regular ZMQ socket in non-blocking mode for maximum reliability.
+import zmq
+
+# --- Project imports (runtime + Pylance type checking) ---
 from runner.config import Config, parse_dt
-from common.events import MarketSnapshot, OrderRequest, PositionSnapshot
 from common.eventlog import EventLogger
+from common.events import MarketSnapshot, OrderRequest, PositionSnapshot
 
-from market_feed.synthetic import SyntheticMinuteFeed
-from market_feed.folder_1m import FolderMinuteFeed
-from market_feed.matrix_store_1m import MatrixStoreMinuteFeed
-
+if TYPE_CHECKING:
+    # Only needed for type checkers / IDE intellisense.
+    from common.events import FillEvent, OrderAck, TradeOpen, TradeClose
 from execution.paper import PaperExecutionEngine
-from strategy.toy_rebalance import ToyRebalanceStrategy
+from market_feed import SyntheticMinuteFeed, FolderMinuteFeed, MatrixStoreMinuteFeed
 from analytics.build import build_derived_from_events
 
-import importlib
+# --- ZMQ Publisher Class ---
+class ZmqPublisher:
+    def __init__(self, host: str = "127.0.0.1", port: int = 5555, snd_hwm: int = 10000):
+        self.host = host
+        self.port = int(port)
+        self.ctx = zmq.Context.instance()
+        self.socket = self.ctx.socket(zmq.PUB)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.SNDHWM, int(snd_hwm))
+        self.socket.bind(f"tcp://{self.host}:{self.port}")
+
+    async def publish(self, topic: str, data: dict) -> None:
+        """Best-effort publish (never blocks the engine loop)."""
+        try:
+            self.socket.send_multipart(
+                [topic.encode("utf-8"), json.dumps(data, default=self._json_default).encode("utf-8")],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            # Drop if subscriber is slow / queue is full.
+            return
+        except Exception as e:
+            # Keep the engine alive even if the dashboard is not running.
+            print(f"ZMQ Publish Error: {e}")
+
+    @staticmethod
+    def _json_default(o: Any):
+        """Make common python objects JSON serializable (esp. datetime in events)."""
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        if isinstance(o, Decimal):
+            return float(o)
+        if isinstance(o, uuid.UUID):
+            return str(o)
+        if isinstance(o, Path):
+            return str(o)
+        # pydantic BaseModel or similar
+        if hasattr(o, "model_dump"):
+            try:
+                return o.model_dump(mode="json")
+            except TypeError:
+                return o.model_dump()
+        # last-resort fallback (keeps engine alive)
+        return str(o)
+
+    def close(self) -> None:
+        try:
+            self.socket.close(0)
+        except Exception:
+            pass
+
+
+# --- Factories ---
 
 def _make_feed(cfg: Config):
     ftype = cfg.get("market_feed","type")
@@ -44,7 +106,7 @@ def _make_feed(cfg: Config):
             end_dt = parse_dt(end)
 
         fmt = cfg.get("market_feed","format", default="csv")
-        symbols = cfg.get("market_feed","symbols", default=None)  # may be None for autodiscover
+        symbols = cfg.get("market_feed","symbols", default=None)
 
         return FolderMinuteFeed(
             data_dir=cfg.get("market_feed","data_dir"),
@@ -120,10 +182,10 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
     desired_notional = {sym: float(w) * nav for sym, w in target_w.items()}
     orders: List[OrderRequest] = []
 
+    # Sell logic
     for sym, qty in cur_pos.items():
         px = float(prices.get(sym, 0.0))
-        if px <= 0:
-            continue
+        if px <= 0: continue
         cur_val = qty * px
         tgt_val = desired_notional.get(sym, 0.0)
         if cur_val > tgt_val + 1e-9:
@@ -132,16 +194,15 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
             if sell_qty > 0:
                 orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="SELL", qty=sell_qty))
 
+    # Buy logic
     remaining = cash
     for sym, w in sorted(target_w.items(), key=lambda kv: kv[1], reverse=True):
         px = float(prices.get(sym, 0.0))
-        if px <= 0:
-            continue
+        if px <= 0: continue
         qty = int(cur_pos.get(sym, 0))
         cur_val = qty * px
         tgt_val = desired_notional.get(sym, 0.0)
-        if cur_val + 1e-9 >= tgt_val:
-            continue
+        if cur_val + 1e-9 >= tgt_val: continue
         buy_val = tgt_val - cur_val
         buy_qty = int(math.floor(buy_val / px))
         buy_qty = min(buy_qty, int(math.floor(remaining / px)))
@@ -151,23 +212,56 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
 
     return orders
 
+# --- Core Event Engine ---
+
+async def _produce_market_data(feed, queue: asyncio.Queue):
+    """Reads from the historical feed and pushes snapshots to the queue."""
+    async for snap in feed.stream():
+        await queue.put(snap)
+    # Signal end of stream
+    await queue.put(None)
+
 async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj=None) -> None:
     log = logger_obj
-    if log:
-        log.info("Building market feed...")
+    
+    # 1. Initialize Components
+    if log: log.info("Building engine components...")
     feed = _make_feed(cfg)
-    if log:
-        log.info("Building execution engine...")
     exe = _make_execution(cfg)
-    if log:
-        log.info("Building strategy...")
     strat = _make_strategy(cfg)
+    
+    # Initialize ZMQ Publisher (for Qt Dashboard)
+    zmq_host = str(cfg.get("ui", "zmq_host", default="127.0.0.1"))
+    zmq_port = int(cfg.get("ui", "zmq_port", default=5555))
+    publish_every_ticks = int(cfg.get("ui", "publish_every_ticks", default=1))
 
+    pub = ZmqPublisher(host=zmq_host, port=zmq_port)
+    if log: log.info("ZMQ Publisher bound to tcp://%s:%d (publish_every_ticks=%d)", zmq_host, zmq_port, publish_every_ticks)
+
+    # 2. Setup State & Logging
     start = parse_dt(cfg.get("market_feed","start"))
     port = exe.snapshot(start)
     logger.append(port)
+    print(f"DEBUG: Publishing NAV {port.nav}") 
 
-    # OPTIMIZATION: Open a lightweight CSV for real-time NAV dashboarding
+    # Give SUB clients a brief moment to connect so they don't miss the first tick.
+    await asyncio.sleep(0.2)
+    # Send a fully-populated NAV packet so the dashboard can render immediately.
+    _positions0 = dict(port.positions)
+    _pos_values0 = {}
+    for _sym, _qty in _positions0.items():
+        _px = float(port.mtm_prices.get(_sym, 0.0))
+        _pos_values0[_sym] = float(_qty) * _px
+
+    await pub.publish("nav", {
+        "ts": port.ts.isoformat(),
+        "nav": float(port.nav),
+        "cash": float(port.cash),
+        "positions": _positions0,
+        "pos_values": _pos_values0,
+    })
+
+    # Lightweight CSV logging (backup for Dashboard)
     nav_csv_path = run_dir / "nav.csv"
     nav_file = open(nav_csv_path, "w", newline="")
     nav_writer = csv.writer(nav_file)
@@ -175,47 +269,110 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
     nav_writer.writerow([start.isoformat(), port.nav, port.cash])
     nav_file.flush()
 
-    if log:
-        log.info("Initial snapshot written (NAV=%.2f, cash=%.2f)", port.nav, port.cash)
+    if log: log.info("Engine started. Initial NAV=%.2f", port.nav)
+
+    # 3. The Event Loop Setup
+    queue = asyncio.Queue(maxsize=1000) # Buffer to prevent memory explosion
+    
+    # Start the "Producer" (Market Feed)
+    producer_task = asyncio.create_task(_produce_market_data(feed, queue))
 
     tick_count = 0
     try:
-        async for snap in feed.stream():
-            tick_count += 1
-            exe.update_market(snap)
+        while True:
+            # Wait for next event
+            event = await queue.get()
 
-            # OPTIMIZATION: Do NOT log the market snapshot. It is redundant and massive.
-            # logger.append(snap) 
+            # Sentinel Check (End of Stream)
+            if event is None:
+                break
 
-            strat.on_snapshot(snap, port)
-            target_w = getattr(strat, "_last_target_weights", None)
+            # --- Dispatch Logic ---
 
-            if isinstance(target_w, dict) and target_w:
-                orders = _rebalance(snap.ts, target_w, snap, port)
-                if orders:
-                    logger.append_many(orders)
-                    for e in exe.place_orders(snap.ts, orders):
-                        logger.append(e)
+            if isinstance(event, MarketSnapshot):
+                tick_count += 1
+                
+                # 1. Update Execution State (Mark-to-Market)
+                exe.update_market(event)
 
-            port = exe.snapshot(snap.ts)
-            
-            # Log position snapshot (now lightweight) to JSONL for audit
-            logger.append(port)
+                # 2. Strategy Logic
+                strat.on_snapshot(event, port)
+                
+                # 3. Generate Orders
+                orders: List[OrderRequest] = []
+                target_w = getattr(strat, "_last_target_weights", None)
+                if isinstance(target_w, dict) and target_w:
+                    orders = _rebalance(event.ts, target_w, event, port)
+                    
+                    if orders:
+                        logger.append_many(orders)
+                        
+                        # 4. Route Orders (Simulation)
+                        # In Paper Trading, this returns Fills immediately.
+                        execution_events = exe.place_orders(event.ts, orders)
 
-            # Log NAV to CSV for fast Dashboard access
-            nav_writer.writerow([snap.ts.isoformat(), port.nav, port.cash])
-            # Flush every few ticks to allow dashboard to see updates without killing I/O
-            if tick_count % 10 == 0:
-                nav_file.flush()
+                        # NOTE: PaperExecutionEngine emits plain dicts (via .model_dump()).
+                        # We log everything and only special-case fills + the latest portfolio snapshot.
+                        for e_evt in execution_events:
+                            logger.append(e_evt)
 
-            if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):
-                log.info("Progress: ticks=%d | ts=%s | NAV=%.2f | cash=%.2f | n_syms=%d",
-                        tick_count, snap.ts.isoformat(), port.nav, port.cash, len(snap.prices))
+                            if isinstance(e_evt, dict):
+                                kind = e_evt.get("kind")
+
+                                # BROADCAST FILL TO UI
+                                if kind == "fill":
+                                    await pub.publish("fill", e_evt)
+
+                                # Keep `port` as a PositionSnapshot model for downstream code
+                                elif kind == "position_snapshot":
+                                    port = PositionSnapshot(**e_evt)
+                
+                # 5. Portfolio Snapshot (always refresh `port` for correctness)
+                #
+                # Even though PaperExecutionEngine returns a PositionSnapshot event, we also
+                # refresh from the engine here to keep `port` consistent (and to simplify UI publishing).
+                refreshed = exe.snapshot(event.ts)
+                if not orders:
+                    # Only append to logs when no orders were placed (avoids duplicate snapshots).
+                    logger.append(refreshed)
+                port = refreshed
+
+                # 6. Dashboard & Monitor Updates
+                nav_writer.writerow([event.ts.isoformat(), port.nav, port.cash])
+                if tick_count % 10 == 0:
+                    nav_file.flush()
+                # BROADCAST NAV TO UI (throttled to avoid UI backlog in fast backtests)
+                if tick_count % publish_every_ticks == 0:
+                    # Include positions so the dashboard can render the Symbol/Qty/Value table.
+                    positions = dict(port.positions)
+                    # Use current market snapshot prices to compute per-symbol value.
+                    pos_values = {}
+                    for sym, qty in positions.items():
+                        px = float(event.prices.get(sym, 0.0))
+                        pos_values[sym] = float(qty) * px
+
+                    await pub.publish("nav", {
+                        "ts": event.ts.isoformat(),
+                        "nav": float(port.nav),
+                        "cash": float(port.cash),
+                        "positions": positions,
+                        "pos_values": pos_values
+                    })
+                if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):
+                    log.info("Ticks=%d | %s | NAV=%.2f", tick_count, event.ts, port.nav)
+
+            # In Live Trading, you would handle asynchronous fills here:
+            # elif isinstance(event, FillEvent):
+            #     port.apply_fill(event)
+            #     await pub.publish("fill", event.model_dump())
+
+            queue.task_done()
+
     finally:
+        # Cleanup
+        producer_task.cancel()
         nav_file.close()
+        pub.close()
 
-    if log:
-        log.info("Streaming finished. Total ticks=%d. Building derived outputs...", tick_count)
+    if log: log.info("Run finished. Ticks=%d", tick_count)
     build_derived_from_events(run_dir)
-    if log:
-        log.info("Derived outputs built: %s", (Path(run_dir) / "derived"))

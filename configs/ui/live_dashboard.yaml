@@ -1,3 +1,11 @@
 ui:
+  # ZMQ settings for the Qt real-time dashboard (ui/qt_dashboard.py)
+  zmq_host: 127.0.0.1
+  zmq_port: 5555
+  # In FAST backtests, publishing every tick can overwhelm the UI.
+  # Increase if your chart looks frozen during fast runs.
+  publish_every_ticks: 1
+
+  # Streamlit dashboard settings (ui/live_dashboard.py)
   live_dashboard:
     refresh_seconds: 2

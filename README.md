@@ -43,6 +43,33 @@ runs/<run_id>/
 streamlit run ui/live_dashboard.py -- --run runs/<run_id>
 ```
 
+
+
+## Qt real-time dashboard (ZMQ)
+
+This repo can stream live NAV + fills over ZMQ for a lightweight desktop dashboard.
+
+### 1) Start the Qt dashboard (in one CMD window)
+```bash
+python ui/qt_dashboard.py --url tcp://127.0.0.1:5555
+```
+
+### 2) Run an experiment (in another CMD window)
+```bash
+levitate configs/run/demo_synth.yaml
+# or
+python -m runner configs/run/demo_synth.yaml
+```
+
+### Tuning (important for FAST backtests)
+If the run is very fast, the UI may *look* frozen because the engine produces ticks faster than Qt can draw.
+
+You can tune:
+- `ui.publish_every_ticks` (default 5): publish one NAV update every N ticks
+- `market_feed.speed: realtime` (or a slower speed) to make it visibly live
+
+See `configs/ui/live_dashboard.yaml` for these UI keys.
+
 ## Smoke tests
 ```bash
 pytest -q
