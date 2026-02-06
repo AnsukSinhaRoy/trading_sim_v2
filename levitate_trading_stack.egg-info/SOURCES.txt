@@ -32,3 +32,4 @@ runner/logging_utils.py
 runner/run.py
 strategy/__init__.py
 strategy/toy_rebalance.py
+strategy/xs_mom_vol_target.py

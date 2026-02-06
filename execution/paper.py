@@ -66,7 +66,9 @@ class PaperExecutionEngine:
     def snapshot(self, ts: datetime) -> PositionSnapshot:
         mtm = dict(self.last_prices)
         nav = self.portfolio.nav(mtm)
-        return PositionSnapshot(ts=ts, cash=self.portfolio.cash, positions=dict(self.portfolio.positions), mtm_prices=mtm, nav=nav)
+        # OPTIMIZATION: Do not save the full price universe in the snapshot.
+        # This was causing massive log bloat (40GB+).
+        return PositionSnapshot(ts=ts, cash=self.portfolio.cash, positions=dict(self.portfolio.positions), mtm_prices={}, nav=nav)
 
     def _trade_bookkeeping(self, ts: datetime, symbol: str, side: str, qty: int, price: float, events: List[dict]) -> None:
         # Toy avg-cost, long-only trade tracking

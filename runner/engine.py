@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List
-import uuid, math
+import uuid, math, csv
 
 from runner.config import Config, parse_dt
 from common.events import MarketSnapshot, OrderRequest, PositionSnapshot
@@ -99,11 +99,9 @@ def _make_strategy(cfg):
     params = dict(cfg.raw.get("strategy", {}))
     params.pop("type", None)
 
-    # type: "some.module:ClassName"
     if ":" in stype:
         mod_name, cls_name = stype.split(":", 1)
     else:
-        # fallback: "xs_mom_vol_target" -> strategy.xs_mom_vol_target:XsMomVolTargetStrategy
         mod_name = f"strategy.{stype}"
         cls_name = "".join(p.capitalize() for p in stype.split("_")) + "Strategy"
 
@@ -122,7 +120,6 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
     desired_notional = {sym: float(w) * nav for sym, w in target_w.items()}
     orders: List[OrderRequest] = []
 
-    # Sell down to target
     for sym, qty in cur_pos.items():
         px = float(prices.get(sym, 0.0))
         if px <= 0:
@@ -135,7 +132,6 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
             if sell_qty > 0:
                 orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="SELL", qty=sell_qty))
 
-    # Buy up (best-effort with current cash)
     remaining = cash
     for sym, w in sorted(target_w.items(), key=lambda kv: kv[1], reverse=True):
         px = float(prices.get(sym, 0.0))
@@ -170,30 +166,53 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
     start = parse_dt(cfg.get("market_feed","start"))
     port = exe.snapshot(start)
     logger.append(port)
+
+    # OPTIMIZATION: Open a lightweight CSV for real-time NAV dashboarding
+    nav_csv_path = run_dir / "nav.csv"
+    nav_file = open(nav_csv_path, "w", newline="")
+    nav_writer = csv.writer(nav_file)
+    nav_writer.writerow(["ts", "nav", "cash"])
+    nav_writer.writerow([start.isoformat(), port.nav, port.cash])
+    nav_file.flush()
+
     if log:
         log.info("Initial snapshot written (NAV=%.2f, cash=%.2f)", port.nav, port.cash)
 
     tick_count = 0
-    async for snap in feed.stream():
-        tick_count += 1
-        exe.update_market(snap)
+    try:
+        async for snap in feed.stream():
+            tick_count += 1
+            exe.update_market(snap)
 
-        strat.on_snapshot(snap, port)
-        target_w = getattr(strat, "_last_target_weights", None)
+            # OPTIMIZATION: Do NOT log the market snapshot. It is redundant and massive.
+            # logger.append(snap) 
 
-        if isinstance(target_w, dict) and target_w:
-            orders = _rebalance(snap.ts, target_w, snap, port)
-            if orders:
-                logger.append_many(orders)
-                for e in exe.place_orders(snap.ts, orders):
-                    logger.append(e)
+            strat.on_snapshot(snap, port)
+            target_w = getattr(strat, "_last_target_weights", None)
 
-        port = exe.snapshot(snap.ts)
-        logger.append(port)
+            if isinstance(target_w, dict) and target_w:
+                orders = _rebalance(snap.ts, target_w, snap, port)
+                if orders:
+                    logger.append_many(orders)
+                    for e in exe.place_orders(snap.ts, orders):
+                        logger.append(e)
 
-        if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):
-            log.info("Progress: ticks=%d | ts=%s | NAV=%.2f | cash=%.2f | n_syms=%d",
-                     tick_count, snap.ts.isoformat(), port.nav, port.cash, len(snap.prices))
+            port = exe.snapshot(snap.ts)
+            
+            # Log position snapshot (now lightweight) to JSONL for audit
+            logger.append(port)
+
+            # Log NAV to CSV for fast Dashboard access
+            nav_writer.writerow([snap.ts.isoformat(), port.nav, port.cash])
+            # Flush every few ticks to allow dashboard to see updates without killing I/O
+            if tick_count % 10 == 0:
+                nav_file.flush()
+
+            if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):
+                log.info("Progress: ticks=%d | ts=%s | NAV=%.2f | cash=%.2f | n_syms=%d",
+                        tick_count, snap.ts.isoformat(), port.nav, port.cash, len(snap.prices))
+    finally:
+        nav_file.close()
 
     if log:
         log.info("Streaming finished. Total ticks=%d. Building derived outputs...", tick_count)

@@ -51,6 +51,15 @@ def main() -> None:
     if not cfg_path:
         ap.error("missing config file (provide positional config or --config <path>)")
 
+    # --- NEW LOGIC START ---
+    # If the file doesn't exist in the current directory, check configs/run/
+    if not Path(cfg_path).exists():
+        candidate = Path("configs/run") / cfg_path
+        if candidate.exists():
+            print(f"Info: Config resolved to '{candidate}'")
+            cfg_path = str(candidate)
+    # --- NEW LOGIC END ---
+
     if _is_preprocess_yaml(cfg_path):
         # Preprocess is always foreground for now (it's a batch job)
         run_preprocess(cfg_path)
