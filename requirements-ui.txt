@@ -1,0 +1,3 @@
+# Optional desktop UI dependencies (Qt dashboard)
+PyQt6>=6.5
+pyqtgraph>=0.13

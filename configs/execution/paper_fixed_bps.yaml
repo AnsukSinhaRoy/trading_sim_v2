@@ -1,5 +1,5 @@
 execution:
-  initial_cash: 1000000
+  initial_cash: 10_000_000
   slippage:
     model: fixed_bps
     bps: 3

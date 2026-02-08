@@ -2,8 +2,10 @@ import sys
 import argparse
 import zmq
 import json
+import time
+import math
 from collections import deque
-from typing import Dict, Any, List
+from typing import Dict, List
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -18,16 +20,26 @@ from datetime import datetime
 class ZmqListener(QThread):
     """Receives ZMQ messages on a background thread.
 
-    Design goals:
-    - Never block/freeze the Qt GUI thread.
-    - Avoid backlog in FAST backtests by draining messages quickly and keeping only the latest NAV.
-    """
-    data_signal = pyqtSignal(str, dict)
+    Key constraints for the dashboard:
+    - Qt GUI thread must stay responsive.
+    - In fast backtests, per-message Qt signals can overwhelm the event queue.
 
-    def __init__(self, url: str):
+    Strategy:
+    - Drain the SUB socket quickly.
+    - Keep only the latest NAV per drain cycle.
+    - Batch FILL messages and emit them in chunks.
+    """
+
+    nav_signal = pyqtSignal(dict)
+    fills_signal = pyqtSignal(list)
+
+    def __init__(self, url: str, *, max_fills_emit: int = 2000, poll_ms: int = 50, max_drain_ms: int = 15):
         super().__init__()
         self.url = url
         self._running = True
+        self._max_fills_emit = int(max(1, max_fills_emit))
+        self._poll_ms = int(max(1, poll_ms))
+        self._max_drain_s = float(max(1, max_drain_ms)) / 1000.0
 
     def stop(self):
         self._running = False
@@ -35,9 +47,6 @@ class ZmqListener(QThread):
     def run(self):
         ctx = zmq.Context.instance()
 
-        # Use ONE SUB socket subscribed to both topics.
-        # This avoids platform-specific quirks with CONFLATE and guarantees we always
-        # receive NAV if we receive fills (same transport, same socket).
         sock = ctx.socket(zmq.SUB)
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.RCVHWM, 10000)
@@ -48,29 +57,61 @@ class ZmqListener(QThread):
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
 
-        def _safe_emit(topic_b: bytes, msg_b: bytes):
+        latest_nav = None
+        fills_batch: List[dict] = []
+
+        def _decode(msg_b: bytes):
             try:
-                data = json.loads(msg_b.decode("utf-8"))
-                self.data_signal.emit(topic_b.decode("utf-8"), data)
+                return json.loads(msg_b.decode("utf-8"))
             except Exception as e:
-                # Keep listener alive.
                 print(f"ZMQ decode error: {e}")
+                return None
+
+        def _flush():
+            nonlocal latest_nav, fills_batch
+            if latest_nav is not None:
+                self.nav_signal.emit(latest_nav)
+                latest_nav = None
+            if fills_batch:
+                # Emit in chunks to avoid huge cross-thread payloads.
+                n = len(fills_batch)
+                if n <= self._max_fills_emit:
+                    self.fills_signal.emit(fills_batch)
+                else:
+                    for i in range(0, n, self._max_fills_emit):
+                        self.fills_signal.emit(fills_batch[i:i + self._max_fills_emit])
+                fills_batch = []
 
         try:
             while self._running:
-                events = dict(poller.poll(100))  # 100ms tick
+                events = dict(poller.poll(self._poll_ms))
+
+                # Even if no new events, flush pending batches (rare).
                 if sock not in events:
+                    _flush()
                     continue
 
-                # Drain everything available quickly.
-                # For NAV: GUI keeps only the latest message.
-                # For FILL: GUI buffers and displays all fills.
+                # Drain all available messages quickly, but time-bound.
+                start = time.perf_counter()
                 while True:
+                    if (time.perf_counter() - start) >= self._max_drain_s:
+                        break
                     try:
-                        topic, msg = sock.recv_multipart(flags=zmq.NOBLOCK)
-                        _safe_emit(topic, msg)
+                        topic_b, msg_b = sock.recv_multipart(flags=zmq.NOBLOCK)
                     except zmq.Again:
                         break
+
+                    data = _decode(msg_b)
+                    if data is None:
+                        continue
+
+                    topic = topic_b.decode("utf-8", errors="ignore")
+                    if topic == "nav":
+                        latest_nav = data
+                    elif topic == "fill":
+                        fills_batch.append(data)
+
+                _flush()
         finally:
             try:
                 sock.close(0)
@@ -88,41 +129,54 @@ class RealTimeDashboard(QMainWindow):
         self.resize(1200, 800)
         self.setStyleSheet("background-color: #1e1e1e; color: #dcdcdc;")
 
-        # Data buffers
-        # Keep the latest NAV message and a bounded time-series for plotting.
+        # NAV history (full horizon) + a throttled/downsampled plot.
         self.nav_data: List[float] = []
         self.nav_ts: List[float] = []  # epoch seconds for DateAxisItem
         self._latest_nav = None
-        self._fills_buffer = deque()
-        self._recent_fills = deque(maxlen=50)  # for the Overview "moving rows" effect
+        self._initial_nav = None
+
+        # Fill pipeline
+        self._fills_buffer = deque()            # raw fills waiting to be processed
+        self._recent_fills = deque(maxlen=50)   # for Overview moving rows
+
+        # Fills table rendering (decoupled from fill processing)
+        self._fills_display = deque(maxlen=5000)   # what the Fills tab displays
+        self._fills_pending_render = deque()       # newly processed fills awaiting UI insertion
+        self._fills_table_max_rows = 5000
+        self._fills_table_needs_rebuild = True
 
         # Trade blotter state (derived from fills)
-        # We assume long-only behavior (engine rejects sells beyond holdings), so
-        # a "trade" is defined as: first BUY when position=0 -> final SELL when position returns to 0.
         self._pos_from_fills: Dict[str, int] = {}
         self._open_trade_by_symbol: Dict[str, dict] = {}
-
-        # Persist closed trades for the Trade Inspector. Row index == trade index.
         self._trades: List[dict] = []
 
-        # Per-symbol running PnL state (from fills + latest marks).
-        # For each symbol: {qty, avg_cost, realized}
+        # Per-symbol running PnL state (from fills + latest marks)
         self._pnl_state: Dict[str, dict] = {}
         self._latest_marks: Dict[str, float] = {}
         self._latest_positions: Dict[str, int] = {}
 
-        self._initial_nav = None
+        # Throttles
+        self._plot_fps = 5.0
+        self._max_plot_points = 20000
+        self._last_plot_update = 0.0
+
+        self._fills_table_fps = 4.0
+        self._last_fills_table_update = 0.0
+
+        self._pnl_fps = 5.0
+        self._last_pnl_update = 0.0
 
         self.setup_ui()
 
         # Start listener thread
         self.listener = ZmqListener(self.url)
-        self.listener.data_signal.connect(self.handle_update)
+        self.listener.nav_signal.connect(self.handle_nav_update)
+        self.listener.fills_signal.connect(self.handle_fills_update)
         self.listener.start()
 
         # UI flush timer (smooth updates even with bursty data)
         self.ui_timer = QTimer(self)
-        self.ui_timer.setInterval(100)  # 10 FPS UI updates
+        self.ui_timer.setInterval(100)  # 10 FPS UI tick
         self.ui_timer.timeout.connect(self.flush_ui)
         self.ui_timer.start()
 
@@ -156,7 +210,6 @@ class RealTimeDashboard(QMainWindow):
         overview = QWidget()
         ov_layout = QVBoxLayout(overview)
 
-        # Plot with a timestamp x-axis (DateAxisItem) instead of implicit "steps".
         date_axis = pg.DateAxisItem(orientation="bottom")
         self.plot_widget = pg.PlotWidget(axisItems={"bottom": date_axis})
         self.plot_widget.setBackground("#1e1e1e")
@@ -165,36 +218,35 @@ class RealTimeDashboard(QMainWindow):
         self.nav_curve = self.plot_widget.plot(pen=pg.mkPen(color="#00d4ff", width=2))
         ov_layout.addWidget(self.plot_widget)
 
-        # Keep a small "moving" fills table on Overview (looks great + helps debugging).
         self.ov_fills_table = self.create_table(["Time", "Symbol", "Side", "Qty", "Price", "Fees"])
         self.ov_fills_table.setMaximumHeight(240)
         ov_layout.addWidget(self.ov_fills_table)
-        self.tabs.addTab(overview, "Overview")
+        self._overview_tab_index = self.tabs.addTab(overview, "Overview")
 
         # --- Positions Tab ---
         positions = QWidget()
         pos_layout = QVBoxLayout(positions)
         self.pos_table = self.create_table(["Symbol", "Qty", "Value"])
         pos_layout.addWidget(self.pos_table)
-        self.tabs.addTab(positions, "Positions")
+        self._positions_tab_index = self.tabs.addTab(positions, "Positions")
 
         # --- Fills Tab ---
         fills = QWidget()
         fills_layout = QVBoxLayout(fills)
         self.fills_table = self.create_table(["Time", "Symbol", "Side", "Qty", "Price", "Fees"])
         fills_layout.addWidget(self.fills_table)
-        self.tabs.addTab(fills, "Fills")
+        self._fills_tab_index = self.tabs.addTab(fills, "Fills")
 
-        # --- PnL Tab (per-symbol realized/unrealized) ---
+        # --- PnL Tab ---
         pnl = QWidget()
         pnl_layout = QVBoxLayout(pnl)
         self.pnl_table = self.create_table([
             "Symbol", "Qty", "Avg Cost", "Mark", "Unrealized", "Realized", "Total"
         ])
         pnl_layout.addWidget(self.pnl_table)
-        self.tabs.addTab(pnl, "PnL")
+        self._pnl_tab_index = self.tabs.addTab(pnl, "PnL")
 
-        # --- Trades Tab (round-trip blotter) ---
+        # --- Trades Tab ---
         trades = QWidget()
         trades_layout = QVBoxLayout(trades)
 
@@ -217,12 +269,17 @@ class RealTimeDashboard(QMainWindow):
         splitter.addWidget(inspector)
 
         trades_layout.addWidget(splitter)
-        self.tabs.addTab(trades, "Trades")
+        self._trades_tab_index = self.tabs.addTab(trades, "Trades")
 
-        # Hook selection -> inspector
         self.trades_table.itemSelectionChanged.connect(self._on_trade_selected)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         layout.addWidget(self.tabs, stretch=1)
+
+    def _on_tab_changed(self, idx: int) -> None:
+        # If user opens Fills tab after a while, rebuild from the bounded deque.
+        if idx == getattr(self, "_fills_tab_index", -1):
+            self._fills_table_needs_rebuild = True
 
     def create_stat_label(self, text):
         lbl = QLabel(text)
@@ -237,15 +294,32 @@ class RealTimeDashboard(QMainWindow):
         table.setStyleSheet("QHeaderView::section { background-color: #333; color: white; }")
         return table
 
-    def handle_update(self, topic, data):
-        """Runs on GUI thread (queued signal). Keep it VERY light."""
-        if topic == "nav":
-            self._latest_nav = data
-        elif topic == "fill":
-            self._fills_buffer.append(data)
+    # --- Listener callbacks (Qt GUI thread; keep very light) ---
+    def handle_nav_update(self, data: dict):
+        self._latest_nav = data
+
+    def handle_fills_update(self, fills: list):
+        # Append to processing queue.
+        for f in fills:
+            self._fills_buffer.append(f)
+        # Safety: prevent unbounded memory if UI can't keep up for a long time.
+        if len(self._fills_buffer) > 1_000_000:
+            drop = len(self._fills_buffer) - 1_000_000
+            for _ in range(drop):
+                self._fills_buffer.popleft()
+
+    def _nav_plot_series(self):
+        n = len(self.nav_data)
+        if n <= self._max_plot_points:
+            return self.nav_ts, self.nav_data
+        stride = int(math.ceil(n / float(self._max_plot_points)))
+        return self.nav_ts[::stride], self.nav_data[::stride]
 
     def flush_ui(self):
         """Runs at a fixed UI rate to keep the GUI responsive."""
+        now = time.perf_counter()
+
+        # 1) Apply latest NAV snapshot (keep only latest).
         if self._latest_nav:
             nav = float(self._latest_nav.get("nav", 0.0))
             cash = float(self._latest_nav.get("cash", 0.0))
@@ -262,20 +336,23 @@ class RealTimeDashboard(QMainWindow):
             ts = str(self._latest_nav.get("ts", ""))
             self.lbl_ts.setText(f"TS: {self._fmt_time(ts)}")
 
-            # Plot NAV over time with an actual timestamp x-axis
+            # Append to full-horizon NAV history.
             dt = self._safe_parse_iso(ts)
             x = dt.timestamp() if dt else (self.nav_ts[-1] + 1 if self.nav_ts else 0)
             self.nav_ts.append(float(x))
             self.nav_data.append(nav)
-            if len(self.nav_data) > 2000:
-                self.nav_data = self.nav_data[-2000:]
-                self.nav_ts = self.nav_ts[-2000:]
-            self.nav_curve.setData(self.nav_ts, self.nav_data)
 
-            # Update Symbol / Qty / Value table from the same NAV packet
+            # Throttled + downsampled redraw.
+            if (now - self._last_plot_update) >= (1.0 / self._plot_fps):
+                self._last_plot_update = now
+                xs, ys = self._nav_plot_series()
+                self.nav_curve.setData(xs, ys)
+
+            # Positions & marks from NAV packet
             positions = self._latest_nav.get("positions", {}) if isinstance(self._latest_nav, dict) else {}
             pos_values = self._latest_nav.get("pos_values", {}) if isinstance(self._latest_nav, dict) else {}
             self._latest_positions = {str(k): int(v) for k, v in (positions or {}).items()}
+
             self._latest_marks = {}
             for sym, qty in self._latest_positions.items():
                 if qty:
@@ -283,61 +360,52 @@ class RealTimeDashboard(QMainWindow):
                         self._latest_marks[sym] = float((pos_values or {}).get(sym, 0.0)) / float(qty)
                     except Exception:
                         self._latest_marks[sym] = 0.0
+
             self._render_positions(positions, pos_values)
+
+        # 2) Process fills (state updates) with a time budget so we can catch up.
+        backlog = len(self._fills_buffer)
+        budget = 0.02
+        if backlog > 2000:
+            budget = 0.04
+        if backlog > 10000:
+            budget = 0.08
+
+        start = time.perf_counter()
+        processed = 0
+        max_per_tick = 50000
+
+        while self._fills_buffer and (time.perf_counter() - start) < budget and processed < max_per_tick:
+            f = self._fills_buffer.popleft()
+
+            # Update state
+            self._update_pnl_from_fill(f)
+            self._update_trade_blotter_from_fill(f)
+
+            # Buffers for display
+            self._recent_fills.append(f)
+            self._fills_display.append(f)
+
+            # Only queue for rendering if the Fills tab is active; otherwise rebuild on demand.
+            if self.tabs.currentIndex() == self._fills_tab_index:
+                self._fills_pending_render.append(f)
+            else:
+                self._fills_table_needs_rebuild = True
+
+            processed += 1
+
+        # 3) Lightweight UI updates
+        self._render_recent_fills()
+        self._flush_fills_table(now)
+
+        # PnL table render (throttled). We render regardless of tab to keep it fresh,
+        # but it's still throttled to avoid excessive work.
+        if (now - self._last_pnl_update) >= (1.0 / self._pnl_fps):
+            self._last_pnl_update = now
             self._render_pnl_table()
 
-        # Render a limited number of fills per UI tick
-        max_rows = 25
-        for _ in range(max_rows):
-            if not self._fills_buffer:
-                break
-            data = self._fills_buffer.popleft()
-
-            # Update running per-symbol PnL + trade blotter from fills
-            self._update_pnl_from_fill(data)
-            self._update_trade_blotter_from_fill(data)
-
-            # Also append to the Overview "Recent Fills" table
-            self._recent_fills.append(data)
-
-            ts = str(data.get("ts", ""))
-            # If ts is ISO, show HH:MM:SS
-            time_str = ts[11:19] if len(ts) >= 19 else ts
-
-            row = self.fills_table.rowCount()
-            self.fills_table.insertRow(row)
-            self.fills_table.setItem(row, 0, QTableWidgetItem(time_str))
-            self.fills_table.setItem(row, 1, QTableWidgetItem(str(data.get("symbol", ""))))
-            self.fills_table.setItem(row, 2, QTableWidgetItem(str(data.get("side", ""))))
-            self.fills_table.setItem(row, 3, QTableWidgetItem(str(data.get("qty", ""))))
-            self.fills_table.setItem(row, 4, QTableWidgetItem(str(data.get("price", ""))))
-            self.fills_table.setItem(row, 5, QTableWidgetItem(str(data.get("fees", ""))))
-            self.fills_table.scrollToBottom()
-
-        # Refresh Overview fills table from the bounded recent buffer
-        self._render_recent_fills()
-
-        # Keep table from growing without bound
-        if self.fills_table.rowCount() > 1000:
-            # delete oldest rows
-            remove_count = self.fills_table.rowCount() - 1000
-            for _ in range(remove_count):
-                self.fills_table.removeRow(0)
-
-        # Keep trades table bounded
-        if hasattr(self, "trades_table") and self.trades_table.rowCount() > 2000:
-            remove_count = self.trades_table.rowCount() - 2000
-            for _ in range(remove_count):
-                self.trades_table.removeRow(0)
-            # Keep inspector backing list aligned
-            for _ in range(min(remove_count, len(self._trades))):
-                self._trades.pop(0)
-
-
     def _render_positions(self, positions: dict, pos_values: dict):
-        # Rebuild the table from the latest snapshot (small universe => fast enough)
         self.pos_table.setRowCount(0)
-        # Sort by value (descending)
         rows = []
         for sym, qty in (positions or {}).items():
             try:
@@ -355,11 +423,9 @@ class RealTimeDashboard(QMainWindow):
             self.pos_table.setItem(r, 2, QTableWidgetItem(f"{v:,.2f}"))
 
     def _render_recent_fills(self) -> None:
-        """Render the small "moving rows" fills table on the Overview tab."""
         if not hasattr(self, "ov_fills_table"):
             return
         self.ov_fills_table.setRowCount(0)
-        # Show newest at the bottom.
         for f in list(self._recent_fills)[-50:]:
             ts = str(f.get("ts", ""))
             time_str = ts[11:19] if len(ts) >= 19 else ts
@@ -373,8 +439,75 @@ class RealTimeDashboard(QMainWindow):
             self.ov_fills_table.setItem(r, 5, QTableWidgetItem(str(f.get("fees", ""))))
         self.ov_fills_table.scrollToBottom()
 
+    def _flush_fills_table(self, now: float) -> None:
+        # Only touch the big fills table at a limited rate.
+        if (now - self._last_fills_table_update) < (1.0 / self._fills_table_fps):
+            return
+        self._last_fills_table_update = now
+
+        if self.tabs.currentIndex() != self._fills_tab_index:
+            # Avoid growing pending queue when tab is not active.
+            self._fills_pending_render.clear()
+            return
+
+        if self._fills_table_needs_rebuild:
+            self._rebuild_fills_table_from_display()
+            self._fills_table_needs_rebuild = False
+            self._fills_pending_render.clear()
+            return
+
+        if not self._fills_pending_render:
+            return
+
+        # Append a bounded number of rows per refresh to avoid UI stalls.
+        batch_max = 500
+        n = min(batch_max, len(self._fills_pending_render))
+
+        self.fills_table.setUpdatesEnabled(False)
+        self.fills_table.blockSignals(True)
+        try:
+            for _ in range(n):
+                f = self._fills_pending_render.popleft()
+                self._append_fill_row_to_table(f)
+
+            # Keep table from growing without bound (display-only cap).
+            overflow = self.fills_table.rowCount() - self._fills_table_max_rows
+            for _ in range(max(0, overflow)):
+                self.fills_table.removeRow(0)
+        finally:
+            self.fills_table.blockSignals(False)
+            self.fills_table.setUpdatesEnabled(True)
+
+        self.fills_table.scrollToBottom()
+
+    def _rebuild_fills_table_from_display(self) -> None:
+        if not hasattr(self, "fills_table"):
+            return
+        self.fills_table.setUpdatesEnabled(False)
+        self.fills_table.blockSignals(True)
+        try:
+            self.fills_table.setRowCount(0)
+            for f in list(self._fills_display)[-self._fills_table_max_rows:]:
+                self._append_fill_row_to_table(f)
+        finally:
+            self.fills_table.blockSignals(False)
+            self.fills_table.setUpdatesEnabled(True)
+        self.fills_table.scrollToBottom()
+
+    def _append_fill_row_to_table(self, data: dict) -> None:
+        ts = str(data.get("ts", ""))
+        # Show full date+time in Fills tab to match your earlier request.
+        time_str = self._fmt_time(ts)
+        row = self.fills_table.rowCount()
+        self.fills_table.insertRow(row)
+        self.fills_table.setItem(row, 0, QTableWidgetItem(time_str))
+        self.fills_table.setItem(row, 1, QTableWidgetItem(str(data.get("symbol", ""))))
+        self.fills_table.setItem(row, 2, QTableWidgetItem(str(data.get("side", ""))))
+        self.fills_table.setItem(row, 3, QTableWidgetItem(str(data.get("qty", ""))))
+        self.fills_table.setItem(row, 4, QTableWidgetItem(str(data.get("price", ""))))
+        self.fills_table.setItem(row, 5, QTableWidgetItem(str(data.get("fees", ""))))
+
     def _update_pnl_from_fill(self, fill: dict) -> None:
-        """Update per-symbol realized PnL + cost basis from fills (long-only)."""
         sym = str(fill.get("symbol", ""))
         side = str(fill.get("side", "")).upper()
         if not sym or side not in {"BUY", "SELL"}:
@@ -405,7 +538,6 @@ class RealTimeDashboard(QMainWindow):
         cur_avg = float(st.get("avg_cost", 0.0))
 
         if side == "BUY":
-            # Treat buy fees as part of the cost basis.
             old_cost = cur_qty * cur_avg
             new_cost = qty * price + fees
             new_qty = cur_qty + qty
@@ -413,7 +545,6 @@ class RealTimeDashboard(QMainWindow):
             st["avg_cost"] = (old_cost + new_cost) / float(new_qty) if new_qty else 0.0
         else:
             sell_qty = min(qty, cur_qty)
-            # Realized PnL: (sell - cost) - sell_fees
             st["realized"] = float(st.get("realized", 0.0)) + (sell_qty * (price - cur_avg) - fees)
             st["qty"] = max(0, cur_qty - sell_qty)
             if st["qty"] == 0:
@@ -432,7 +563,6 @@ class RealTimeDashboard(QMainWindow):
             unreal = (qty * (mark - avg_cost)) if qty else 0.0
             total = realized + unreal
 
-            # Hide completely empty symbols to reduce noise.
             if qty == 0 and abs(total) < 1e-9 and abs(realized) < 1e-9:
                 continue
 
@@ -453,10 +583,8 @@ class RealTimeDashboard(QMainWindow):
             self.pnl_table.setItem(r, 6, QTableWidgetItem(f"{total:,.2f}"))
 
     def _fmt_time(self, ts: str) -> str:
-        """Format ISO datetime string to something readable."""
         if not ts:
             return ""
-        # Most of your engine emits ISO like 2026-02-06T12:34:56
         if len(ts) >= 19 and "T" in ts:
             return ts.replace("T", " ")[:19]
         return ts
@@ -468,17 +596,6 @@ class RealTimeDashboard(QMainWindow):
             return None
 
     def _update_trade_blotter_from_fill(self, fill: dict) -> None:
-        """Create a per-trade (round-trip) record from raw fills.
-
-        Definition (long-only):
-        - Trade opens on first BUY when position was 0.
-        - Trade closes when position returns to 0 after SELL fills.
-
-        We compute:
-        - Entry VWAP from all BUY fills during the trade
-        - Exit VWAP from all SELL fills during the trade
-        - PnL = (sell_notional - sell_fees) - (buy_notional + buy_fees)
-        """
         sym = str(fill.get("symbol", ""))
         side = str(fill.get("side", "")).upper()
         if not sym or side not in {"BUY", "SELL"}:
@@ -503,7 +620,6 @@ class RealTimeDashboard(QMainWindow):
         ts = str(fill.get("ts", ""))
         pos = int(self._pos_from_fills.get(sym, 0))
 
-        # Minimal fill record for the Trade Inspector.
         fill_rec = {
             "ts": ts,
             "side": side,
@@ -513,7 +629,6 @@ class RealTimeDashboard(QMainWindow):
         }
 
         if side == "BUY":
-            # Open a trade if we were flat
             if pos == 0 and sym not in self._open_trade_by_symbol:
                 self._open_trade_by_symbol[sym] = {
                     "entry_ts": ts,
@@ -528,7 +643,6 @@ class RealTimeDashboard(QMainWindow):
                     "fills": [],
                 }
 
-            # If we somehow missed the open (e.g., UI started mid-run), still create one.
             if sym not in self._open_trade_by_symbol:
                 self._open_trade_by_symbol[sym] = {
                     "entry_ts": ts,
@@ -551,10 +665,9 @@ class RealTimeDashboard(QMainWindow):
             pos += qty
             t["max_pos"] = max(int(t.get("max_pos", 0)), int(pos))
 
-        else:  # SELL
+        else:
             t = self._open_trade_by_symbol.get(sym)
             if t is None:
-                # Sell without an open trade (should not happen in long-only), just update pos defensively.
                 pos = max(0, pos - qty)
                 self._pos_from_fills[sym] = pos
                 return
@@ -566,8 +679,8 @@ class RealTimeDashboard(QMainWindow):
             t["exit_ts"] = ts
             pos = pos - qty
             t["max_pos"] = max(int(t.get("max_pos", 0)), int(max(pos, 0)))
+
             if pos <= 0:
-                # Close the trade (round trip complete)
                 entry_qty = int(t["buy_qty"]) or 0
                 exit_qty = int(t["sell_qty"]) or 0
                 entry_vwap = (float(t["buy_value"]) / entry_qty) if entry_qty else 0.0
@@ -575,7 +688,6 @@ class RealTimeDashboard(QMainWindow):
 
                 pnl = (float(t["sell_value"]) - float(t["sell_fees"])) - (float(t["buy_value"]) + float(t["buy_fees"]))
 
-                # Duration (best-effort)
                 d0 = self._safe_parse_iso(str(t.get("entry_ts", "")))
                 d1 = self._safe_parse_iso(str(t.get("exit_ts", "")))
                 duration_s = int((d1 - d0).total_seconds()) if (d0 and d1) else 0
@@ -583,7 +695,6 @@ class RealTimeDashboard(QMainWindow):
 
                 max_pos = int(t.get("max_pos", 0))
 
-                # Persist trade for the inspector (row index == trade index)
                 trade_obj = {
                     "symbol": sym,
                     "entry_ts": str(t.get("entry_ts", "")),
@@ -611,7 +722,6 @@ class RealTimeDashboard(QMainWindow):
                     max_pos=max_pos,
                 )
 
-                # Reset state
                 self._open_trade_by_symbol.pop(sym, None)
                 pos = 0
 
@@ -620,6 +730,7 @@ class RealTimeDashboard(QMainWindow):
     def _append_trade_row(self, entry_ts: str, symbol: str, entry_qty: int, entry_vwap: float,
                           exit_ts: str, exit_vwap: float, pnl: float,
                           duration: str, max_pos: int) -> None:
+        # NOTE: no artificial cap (previously 2000) — user explicitly requested unlimited trades.
         r = self.trades_table.rowCount()
         self.trades_table.insertRow(r)
         self.trades_table.setItem(r, 0, QTableWidgetItem(self._fmt_time(entry_ts)))
@@ -643,7 +754,6 @@ class RealTimeDashboard(QMainWindow):
         return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
     def _on_trade_selected(self) -> None:
-        """Populate the Trade Inspector from the selected trade row."""
         if not hasattr(self, "trade_fills_table") or not hasattr(self, "trade_inspector_lbl"):
             return
         items = self.trades_table.selectedItems()

@@ -10,4 +10,4 @@ modules:
   market_feed: ../market_feed/cube_feed.yaml
   execution:   ../execution/paper_fixed_bps.yaml
   strategy:    ../strategy/xs_mom_vol_target.yaml
-  ui:          ../ui/live_dashboard.yaml
+  ui:          ../ui/qt_dashboard.yaml

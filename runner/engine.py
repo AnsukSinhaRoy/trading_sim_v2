@@ -375,4 +375,5 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
         pub.close()
 
     if log: log.info("Run finished. Ticks=%d", tick_count)
-    build_derived_from_events(run_dir)
+    #The next line causes OOM, fix this problem in the future by building derived analytics incrementally instead of all at once at the end of the run.
+    #build_derived_from_events(run_dir)
