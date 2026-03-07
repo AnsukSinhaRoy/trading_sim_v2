@@ -1,0 +1,32 @@
+strategy:
+  # Explicit path keeps things unambiguous.
+  type: "strategy.xs_mom_vol_ema_stop:XSMomVolEmaStopStrategy"
+
+  # --- Long-term / low churn ---
+  rebalance_every_minutes: 10080    # about 1 week
+  target_count: 30
+
+  # --- Signals ---
+  mom_lookback_mins: 1950           # about 5 trading days
+  ema_fast_mins: 1950              # about 5 trading days
+  ema_slow_mins: 7800              # about 20 trading days
+  ema_band: 0.001                  # require fast EMA > slow EMA * (1 + band)
+  min_signal: 0.0
+
+  # --- Risk / constraints ---
+  max_gross_leverage: 1.0
+  cash_buffer: 0.05
+  max_weight: 0.12
+  max_turnover: 0.35
+
+  # --- Stoploss overlay ---
+  stoploss_pct: 0.10
+  stop_cooldown_minutes: 1950
+
+  # Optional portfolio-level drawdown stop. When hit, liquidates existing positions.
+  drawdown_stop: 0.25
+
+  # --- Volatility & correlation estimation (EWMA) ---
+  vol_halflife_mins: 1950
+  corr_halflife_mins: 1950
+  corr_penalty: 0.05

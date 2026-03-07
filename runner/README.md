@@ -33,5 +33,6 @@ The engine is deliberately small and explicit:
 - Feed speed controls (for “real-time-ish” playback vs max-throughput backtests).
 
 ## Extension points
-- Add new strategy types in `engine._make_strategy`.
+- Add new strategies by dropping a module/package under `strategy/` and setting `strategy.type` in YAML.
+  No engine edits are required; the loader resolves strategies by convention (or `module:Class` for explicit paths).
 - Add new execution models (e.g., latency, queueing, partial fills).

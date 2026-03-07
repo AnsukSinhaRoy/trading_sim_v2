@@ -6,5 +6,5 @@ run:
 modules:
   market_feed: ../market_feed/synth_1m.yaml
   execution:   ../execution/paper_fixed_bps.yaml
-  strategy:    ../strategy/toy_rebalance.yaml
+  strategy:    ../strategy/xs_mom_vol_ema_stop.yaml
   ui:          ../ui/qt_dashboard.yaml

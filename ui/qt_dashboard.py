@@ -16,6 +16,33 @@ import pyqtgraph as pg
 from datetime import datetime
 
 
+# --- Custom axis: dense (no gaps for missing days) ---
+class DenseTimeAxis(pg.AxisItem):
+    """Axis that treats x as an integer index and renders the corresponding
+    timestamp label from a backing list. This avoids weekend/holiday gaps
+    when plotting sparse trading timestamps.
+    """
+
+    def __init__(self, get_dt, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._get_dt = get_dt
+
+    def tickStrings(self, values, scale, spacing):
+        out = []
+        for v in values:
+            i = int(round(v))
+            dt = None
+            try:
+                dt = self._get_dt(i)
+            except Exception:
+                dt = None
+            if dt is None:
+                out.append('')
+            else:
+                out.append(dt.strftime('%Y-%m-%d\n%H:%M'))
+        return out
+
+
 # --- Background Listener Thread ---
 class ZmqListener(QThread):
     """Receives ZMQ messages on a background thread.
@@ -131,7 +158,8 @@ class RealTimeDashboard(QMainWindow):
 
         # NAV history (full horizon) + a throttled/downsampled plot.
         self.nav_data: List[float] = []
-        self.nav_ts: List[float] = []  # epoch seconds for DateAxisItem
+        self.nav_x: List[float] = []   # dense integer index for plotting
+        self.nav_dt: List[datetime] = []  # timestamp labels for DenseTimeAxis
         self._latest_nav = None
         self._initial_nav = None
 
@@ -210,8 +238,8 @@ class RealTimeDashboard(QMainWindow):
         overview = QWidget()
         ov_layout = QVBoxLayout(overview)
 
-        date_axis = pg.DateAxisItem(orientation="bottom")
-        self.plot_widget = pg.PlotWidget(axisItems={"bottom": date_axis})
+        dense_axis = DenseTimeAxis(self._get_nav_dt, orientation="bottom")
+        self.plot_widget = pg.PlotWidget(axisItems={"bottom": dense_axis})
         self.plot_widget.setBackground("#1e1e1e")
         self.plot_widget.setTitle("Live NAV", color="#dcdcdc")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -281,6 +309,12 @@ class RealTimeDashboard(QMainWindow):
         if idx == getattr(self, "_fills_tab_index", -1):
             self._fills_table_needs_rebuild = True
 
+    def _get_nav_dt(self, idx: int):
+        """Return the datetime label for a given dense x index."""
+        if 0 <= idx < len(self.nav_dt):
+            return self.nav_dt[idx]
+        return None
+
     def create_stat_label(self, text):
         lbl = QLabel(text)
         lbl.setStyleSheet("font-size: 18px; font-weight: bold; padding: 10px; border: 1px solid #333;")
@@ -311,9 +345,9 @@ class RealTimeDashboard(QMainWindow):
     def _nav_plot_series(self):
         n = len(self.nav_data)
         if n <= self._max_plot_points:
-            return self.nav_ts, self.nav_data
+            return self.nav_x, self.nav_data
         stride = int(math.ceil(n / float(self._max_plot_points)))
-        return self.nav_ts[::stride], self.nav_data[::stride]
+        return self.nav_x[::stride], self.nav_data[::stride]
 
     def flush_ui(self):
         """Runs at a fixed UI rate to keep the GUI responsive."""
@@ -338,8 +372,13 @@ class RealTimeDashboard(QMainWindow):
 
             # Append to full-horizon NAV history.
             dt = self._safe_parse_iso(ts)
-            x = dt.timestamp() if dt else (self.nav_ts[-1] + 1 if self.nav_ts else 0)
-            self.nav_ts.append(float(x))
+            # Use a dense x index so the chart does not include gaps for non-trading days.
+            x = float(len(self.nav_data))
+            self.nav_x.append(x)
+            # Keep the timestamp for x-axis label rendering.
+            if dt is None:
+                dt = datetime.now()
+            self.nav_dt.append(dt)
             self.nav_data.append(nav)
 
             # Throttled + downsampled redraw.

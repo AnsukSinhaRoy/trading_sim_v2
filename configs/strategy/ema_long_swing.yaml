@@ -1,0 +1,45 @@
+strategy:
+  # Slower "swing" variant: fewer rebalances, longer horizon filters.
+  type: "strategy.ema_long:EmaLongStrategy"
+
+  session_start: "09:15"
+  session_end:   "15:30"
+  skip_weekends: true
+  minutes_per_day: 375
+
+  rebalance_every_minutes: 1875     # ~5 days
+  warmup_minutes: 3750              # ~10 days
+  target_count: 10
+  min_hold_minutes: 750             # ~2 days
+
+  ema_fast_mins: 375                # 1 day
+  ema_slow_mins: 1875               # 5 days
+  ema_trend_mins: 7500              # 20 days
+  ema_band: 0.0005
+
+  mom_lookback_mins: 1875
+  vol_halflife_mins: 1875
+
+  mom_weight: 1.0
+  macd_weight: 0.7
+  min_momentum: 0.0
+  min_score: 0.0
+
+  require_price_above_trend: true
+  require_trend_up: true
+  require_slow_up: true
+  max_overbought_pct: 0.12
+
+  max_gross_leverage: 1.0
+  cash_buffer: 0.05
+  max_weight: 0.15
+  max_turnover: 0.25
+  min_rebalance_change: 0.0001
+
+  stoploss_pct: 0.07
+  stop_vol_mult: 2.0
+  stop_max_pct: 0.20
+  stop_cooldown_minutes: 1875
+
+  exit_on_trend_break: true
+  trend_break_buffer: 0.0

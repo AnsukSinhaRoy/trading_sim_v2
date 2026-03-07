@@ -1,0 +1,58 @@
+strategy:
+  # EMA-based long-only allocator with volatility-aware trailing stoploss.
+  # Uses multi-EMA trend filter + momentum ranking + EWMA vol targeting.
+  type: "strategy.ema_long:EmaLongStrategy"
+
+  # ---- session filter (IMPORTANT if your feed forward-fills non-trading minutes) ----
+  # NSE regular session:
+  session_start: "09:15"
+  session_end:   "15:30"
+  skip_weekends: true
+  minutes_per_day: 375
+
+  # ---- cadence (trading minutes) ----
+  # Daily rebalance for a "reasonable holding time" without too much churn.
+  rebalance_every_minutes: 375
+  warmup_minutes: 1500          # ~4 trading days warmup
+  target_count: 10
+  min_hold_minutes: 375         # hold at least ~1 day (unless stop/exit triggers)
+
+  # ---- EMAs (minutes) ----
+  # Faster than swing, but still multi-day trend following:
+  ema_fast_mins: 120            # ~0.3 day
+  ema_slow_mins: 750            # ~2 days
+  ema_trend_mins: 3750          # ~10 days
+  ema_band: 0.0005              # 5 bps fast-over-slow filter
+
+  # ---- momentum / volatility ----
+  mom_lookback_mins: 1500       # ~4 days
+  vol_halflife_mins: 1500
+
+  # ---- scoring ----
+  mom_weight: 1.0
+  macd_weight: 0.7
+  min_momentum: 0.0
+  min_score: 0.0
+
+  # ---- filters ----
+  require_price_above_trend: true
+  require_trend_up: true
+  require_slow_up: true
+  max_overbought_pct: 0.10
+
+  # ---- portfolio / constraints ----
+  max_gross_leverage: 1.0
+  cash_buffer: 0.05
+  max_weight: 0.15
+  max_turnover: 0.35
+  min_rebalance_change: 0.0001
+
+  # ---- exits / stops ----
+  # stoploss_pct is the *minimum* stop; dynamic stop expands with vol.
+  stoploss_pct: 0.06
+  stop_vol_mult: 2.0
+  stop_max_pct: 0.18
+  stop_cooldown_minutes: 750    # ~2 days cooldown
+
+  exit_on_trend_break: true
+  trend_break_buffer: 0.0

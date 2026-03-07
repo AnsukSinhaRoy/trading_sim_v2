@@ -1,0 +1,6 @@
+strategy:
+  type: sparse_sortino_optimizer
+  rebalance_every_minutes: 60
+  lookback: 240
+  max_assets: 5
+  max_gross_leverage: 1.0

@@ -2,7 +2,7 @@ market_feed:
   type: synthetic_1m
   symbols: ["AAA", "BBB", "CCC", "DDD", "EEE"]
   start: "2024-01-01 09:15:00"
-  minutes: 360
+  minutes: 36000000
   init_prices: {"AAA": 100, "BBB": 150, "CCC": 80, "DDD": 220, "EEE": 60}
   vol_bps: 18
   drift_bps: 0.2

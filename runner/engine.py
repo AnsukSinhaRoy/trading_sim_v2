@@ -156,23 +156,120 @@ def _make_execution(cfg: Config):
         fees_bps=float(cfg.get("execution","fees","bps", default=0)),
     )
 
-def _make_strategy(cfg):
+_ACRONYMS = {
+    # Common short acronyms we want to preserve in class names
+    "rl", "xs", "dqn", "ddqn", "ppo", "a2c", "sac", "td3", "lstm", "cnn", "rnn", "mlp"
+}
+
+def _snake_to_strategy_class_name(stype: str) -> str:
+    """
+    Convert a snake_case strategy type (e.g., 'xs_mom_vol_target', 'rl_agent')
+    into the conventional Strategy class name.
+
+    Heuristics:
+      - keep well-known acronyms in ALLCAPS (RL, XS, DQN, ...)
+      - keep 1-2 letter parts in ALLCAPS
+      - otherwise TitleCase each part
+    """
+    parts = [p for p in stype.split("_") if p]
+    out = []
+    for p in parts:
+        pl = p.lower()
+        if pl in _ACRONYMS or len(p) <= 2:
+            out.append(p.upper())
+        else:
+            out.append(p.capitalize())
+    return "".join(out) + "Strategy"
+
+
+def _make_strategy(cfg, run_dir=None):
     stype = cfg.get("strategy", "type")
     params = dict(cfg.raw.get("strategy", {}))
     params.pop("type", None)
 
+    # Optional: provide run_dir to strategies that accept it (used for checkpointing, etc.)
+    if run_dir is not None:
+        params.setdefault("run_dir", str(run_dir))
+
+    def _instantiate(cls):
+        """Instantiate strategy; if it does not accept run_dir, retry without it."""
+        try:
+            return cls(**params)
+        except TypeError as e:
+            msg = str(e)
+            if "run_dir" in params and "run_dir" in msg and (
+                "unexpected keyword argument" in msg or "got an unexpected keyword argument" in msg
+            ):
+                p2 = dict(params)
+                p2.pop("run_dir", None)
+                return cls(**p2)
+            raise
+
+    # Advanced usage: 'some.module.path:ClassName'
     if ":" in stype:
         mod_name, cls_name = stype.split(":", 1)
-    else:
-        mod_name = f"strategy.{stype}"
-        cls_name = "".join(p.capitalize() for p in stype.split("_")) + "Strategy"
+        mod = importlib.import_module(mod_name)
+        if not hasattr(mod, cls_name):
+            raise ValueError(f"Strategy class not found: {mod_name}:{cls_name}")
+        cls = getattr(mod, cls_name)
+        return _instantiate(cls)
 
-    mod = importlib.import_module(mod_name)
-    if not hasattr(mod, cls_name):
-        raise ValueError(f"Strategy class not found: {mod_name}:{cls_name}")
+    base_mod = f"strategy.{stype}"
+    cls_name = _snake_to_strategy_class_name(stype)
 
-    cls = getattr(mod, cls_name)
-    return cls(**params)
+    # Try common layouts:
+    candidates = [
+        base_mod,
+        f"{base_mod}.strategy",
+        f"{base_mod}.agent",
+        f"{base_mod}.impl",
+        f"{base_mod}.core",
+        f"{base_mod}.main",
+    ]
+
+    attempted = []
+    last_strategy_classes = None
+
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            attempted.append(f"{mod_name} (missing)")
+            continue
+
+        attempted.append(mod_name)
+
+        # 1) Exact name match (preferred)
+        if hasattr(mod, cls_name):
+            cls = getattr(mod, cls_name)
+            return _instantiate(cls)
+
+        # 2) Module-provided hook/alias (optional, but convenient)
+        if hasattr(mod, "STRATEGY_CLASS"):
+            cls = getattr(mod, "STRATEGY_CLASS")
+            return _instantiate(cls)
+
+        # 3) Fallback: if there is exactly one *Strategy class in the module, use it
+        strategy_classes = [
+            obj for name, obj in vars(mod).items()
+            if isinstance(obj, type) and name.endswith("Strategy")
+        ]
+        if strategy_classes:
+            last_strategy_classes = [c.__name__ for c in strategy_classes]
+        if len(strategy_classes) == 1:
+            cls = strategy_classes[0]
+            return _instantiate(cls)
+
+    hint = ""
+    if last_strategy_classes:
+        hint = f" Available Strategy classes seen: {last_strategy_classes}."
+    raise ValueError(
+        f"Could not resolve strategy.type='{stype}'. Tried: {attempted}. "
+        f"Expected class '{cls_name}' in one of the modules above, or set strategy.type "
+        f"to an explicit 'module.path:ClassName'.{hint}"
+    )
+
+
 
 def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: PositionSnapshot) -> List[OrderRequest]:
     prices = snap.prices
@@ -228,7 +325,7 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
     if log: log.info("Building engine components...")
     feed = _make_feed(cfg)
     exe = _make_execution(cfg)
-    strat = _make_strategy(cfg)
+    strat = _make_strategy(cfg, run_dir=run_dir)
     
     # Initialize ZMQ Publisher (for Qt Dashboard)
     zmq_host = str(cfg.get("ui", "zmq_host", default="127.0.0.1"))

@@ -91,8 +91,14 @@ def main():
     st.subheader("NAV")
     if len(nav_df) >= 2:
         # Downsample for chart speed if huge
-        chart_data = nav_df if len(nav_df) < 5000 else nav_df.iloc[::5] 
-        st.plotly_chart(px.line(chart_data, x="ts", y="nav"), use_container_width=True)
+        chart_data = nav_df if len(nav_df) < 5000 else nav_df.iloc[::5]
+        # IMPORTANT: treat timestamps as categorical to avoid showing non-trading gaps (weekends/holidays)
+        chart_data = chart_data.copy()
+        chart_data["ts_str"] = chart_data["ts"].dt.strftime("%Y-%m-%d %H:%M")
+        fig = px.line(chart_data, x="ts_str", y="nav")
+        fig.update_xaxes(type="category", title_text="Time")
+        fig.update_yaxes(title_text="NAV")
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.write("Waiting for data...")
 
