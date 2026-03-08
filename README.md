@@ -1,4 +1,5 @@
-# Levitate Trading Stack (config-driven, modular)
+**This is a config-driven, event-sourced trading simulation stack.
+It takes a market feed, lets a strategy compute desired portfolio weights, lets an execution engine convert that into fills, and records everything as events.**
 
 This repo is a **config-driven trading simulation/backtest scaffold** built around a simple principle:
 
