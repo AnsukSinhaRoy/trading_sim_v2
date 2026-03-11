@@ -3,7 +3,7 @@ run:
   out_dir: runs
   seed: 7
   log_level: INFO
-  progress_every_ticks: 250
+  progress_every_ticks: 376
 
 modules:
   market_feed: ../market_feed/cube_feed.yaml
