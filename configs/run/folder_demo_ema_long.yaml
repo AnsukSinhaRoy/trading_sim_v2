@@ -1,0 +1,12 @@
+run:
+  name: demo_folder_1m_ema_long
+  out_dir: runs
+  seed: 7
+  log_level: INFO
+  progress_every_ticks: 250
+
+modules:
+  market_feed: ../market_feed/folder_csv_1m_autodiscover.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/ema_long.yaml
+  ui:          ../ui/qt_dashboard.yaml

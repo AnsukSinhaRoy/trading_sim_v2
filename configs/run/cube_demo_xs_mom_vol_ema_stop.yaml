@@ -1,0 +1,12 @@
+run:
+  name: demo_cube_store_xs_mom_vol_ema_stop
+  out_dir: runs
+  seed: 7
+  log_level: INFO
+  progress_every_ticks: 250
+
+modules:
+  market_feed: ../market_feed/cube_feed.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/xs_mom_vol_ema_stop.yaml
+  ui:          ../ui/qt_dashboard.yaml
