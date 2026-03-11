@@ -3,10 +3,12 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 import asyncio
+import pytest
 
 from market_feed.matrix_store_1m import MatrixStoreMinuteFeed
 
 def test_matrix_store_streams(tmp_path: Path):
+    pytest.importorskip("pyarrow")
     # Create a single date partition with wide data
     ddir = tmp_path / "date=2024-01-01"
     ddir.mkdir(parents=True, exist_ok=True)

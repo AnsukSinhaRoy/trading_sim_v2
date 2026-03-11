@@ -442,10 +442,12 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                 if tick_count % publish_every_ticks == 0:
                     # Include positions so the dashboard can render the Symbol/Qty/Value table.
                     positions = dict(port.positions)
-                    # Use current market snapshot prices to compute per-symbol value.
+                    # Use the execution engine's carried-forward last prices instead of the
+                    # raw sparse minute snapshot. This prevents the UI table from showing
+                    # temporary zero values when a held symbol is absent for a minute.
                     pos_values = {}
                     for sym, qty in positions.items():
-                        px = float(event.prices.get(sym, 0.0))
+                        px = float(exe.last_prices.get(sym, 0.0))
                         pos_values[sym] = float(qty) * px
 
                     await pub.publish("nav", {

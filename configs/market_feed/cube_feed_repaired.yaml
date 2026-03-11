@@ -2,7 +2,7 @@ market_feed:
   type: matrix_store_1m
 
   # IMPORTANT: point to the cube store root
-  store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired"
+  store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired_v2"
 
   # Pick a window (start/end must fall on available dates)
   start: "2015-02-02 09:15:00"

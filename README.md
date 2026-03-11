@@ -1,5 +1,4 @@
-**This is a config-driven, event-sourced trading simulation stack.
-It takes a market feed, lets a strategy compute desired portfolio weights, lets an execution engine convert that into fills, and records everything as events.**
+# Levitate Trading Stack (config-driven, modular)
 
 This repo is a **config-driven trading simulation/backtest scaffold** built around a simple principle:
 
@@ -115,7 +114,9 @@ python ui/qt_dashboard.py --url tcp://127.0.0.1:5555
 ### Run an experiment
 
 ```bash
-python -m runner configs/run/cube_demo.yaml
+python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml
+python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop_v2.yaml --zmq-port 5560
+python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml --zmq-host 127.0.0.1 --zmq-port 5560
 ```
 
 ### Tuning for fast backtests
@@ -147,4 +148,11 @@ levitate configs/run/demo_folder_csv.yaml
 
 ```bash
 pytest -q
+```
+
+
+CLI override example:
+```bash
+python -m runner configs/run/cube_demo_ema_long.yaml --zmq-port 5560
+python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
 ```

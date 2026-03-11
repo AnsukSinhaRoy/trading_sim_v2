@@ -3,12 +3,28 @@ import argparse, asyncio, random, traceback, json
 from pathlib import Path
 from datetime import datetime
 from runner.config import Config
+from runner.config import _deep_merge
 from runner.engine import run_stream
 from common.eventlog import EventLogger
 from runner.logging_utils import setup_logging
 
-def run_once(config_path: str, out_dir_override: str | None = None, name_override: str | None = None) -> Path:
+def run_once(
+    config_path: str,
+    out_dir_override: str | None = None,
+    name_override: str | None = None,
+    zmq_host_override: str | None = None,
+    zmq_port_override: int | None = None,
+) -> Path:
     cfg = Config.load(config_path)
+
+    overrides = {}
+    if zmq_host_override is not None or zmq_port_override is not None:
+        overrides['ui'] = {}
+        if zmq_host_override is not None:
+            overrides['ui']['zmq_host'] = zmq_host_override
+        if zmq_port_override is not None:
+            overrides['ui']['zmq_port'] = int(zmq_port_override)
+        cfg = Config(raw=_deep_merge(cfg.raw, overrides), base_dir=cfg.base_dir)
 
     seed = int(cfg.get("run","seed", default=0))
     if seed:
@@ -47,13 +63,21 @@ def main() -> None:
     ap.add_argument("config_pos", nargs="?", help="Positional run YAML (alternative to --config)")
     ap.add_argument("--out-dir", default=None, help="Override run.out_dir from YAML")
     ap.add_argument("--name", default=None, help="Override run.name from YAML")
+    ap.add_argument("--zmq-host", default=None, help="Override ui.zmq_host from YAML")
+    ap.add_argument("--zmq-port", type=int, default=None, help="Override ui.zmq_port from YAML")
     args = ap.parse_args()
 
     config_path = args.config or args.config_pos
     if not config_path:
         ap.error("missing config file (provide --config <path> or positional config)")
 
-    run_once(config_path, out_dir_override=args.out_dir, name_override=args.name)
+    run_once(
+        config_path,
+        out_dir_override=args.out_dir,
+        name_override=args.name,
+        zmq_host_override=args.zmq_host,
+        zmq_port_override=args.zmq_port,
+    )
 
 if __name__ == "__main__":
     main()

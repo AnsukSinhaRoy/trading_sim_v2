@@ -22,7 +22,19 @@ class PaperExecutionEngine:
         self.open_trades: Dict[str, dict] = {}
 
     def update_market(self, snap: MarketSnapshot) -> None:
-        self.last_prices = dict(snap.prices)
+        """Update the latest market state without zeroing out temporarily-missing symbols.
+
+        `MatrixStoreMinuteFeed` emits sparse per-minute snapshots: symbols with NaN at a
+        given minute are omitted from `snap.prices`. Replacing `self.last_prices` outright
+        causes held symbols to disappear for that minute and get marked to zero in NAV.
+
+        By updating in place, we carry forward the last known price for symbols that are
+        temporarily absent, which keeps minute-level mark-to-market stable while still
+        letting order generation rely on the current snapshot (`snap.prices`).
+        """
+        if not snap.prices:
+            return
+        self.last_prices.update({sym: float(px) for sym, px in snap.prices.items()})
 
     def place_orders(self, ts: datetime, orders: List[OrderRequest]) -> List[dict]:
         events: List[dict] = []
