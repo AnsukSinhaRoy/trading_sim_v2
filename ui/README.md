@@ -32,3 +32,10 @@ python ui/qt_dashboard.py --url tcp://127.0.0.1:5555
 ```
 
 Install optional deps via `requirements-ui.txt` or `pip install -e ".[ui]"`.
+
+
+CLI override example:
+```bash
+python -m runner configs/run/cube_demo_ema_long.yaml --zmq-port 5560
+python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
+```

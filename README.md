@@ -147,3 +147,10 @@ levitate configs/run/demo_folder_csv.yaml
 ```bash
 pytest -q
 ```
+
+
+CLI override example:
+```bash
+python -m runner configs/run/cube_demo_ema_long.yaml --zmq-port 5560
+python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
+```

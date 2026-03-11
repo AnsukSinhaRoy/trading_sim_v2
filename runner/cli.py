@@ -9,12 +9,22 @@ import yaml
 from runner.run import run_once
 from preprocess.build import run_preprocess
 
-def _detach_run(config_path: str, out_dir: str | None, name: str | None) -> None:
+def _detach_run(
+    config_path: str,
+    out_dir: str | None,
+    name: str | None,
+    zmq_host: str | None,
+    zmq_port: int | None,
+) -> None:
     args = [sys.executable, "-u", "-m", "runner", config_path]
     if out_dir:
         args += ["--out-dir", out_dir]
     if name:
         args += ["--name", name]
+    if zmq_host:
+        args += ["--zmq-host", zmq_host]
+    if zmq_port is not None:
+        args += ["--zmq-port", str(zmq_port)]
 
     kwargs = {}
     if sys.platform.startswith("win"):
@@ -45,6 +55,8 @@ def main() -> None:
     ap.add_argument("--out-dir", default=None, help="Override run.out_dir from YAML (run mode only)")
     ap.add_argument("--name", default=None, help="Override run.name from YAML (run mode only)")
     ap.add_argument("--detach", action="store_true", help="Run mode only: run in background (spawns a new console/process).")
+    ap.add_argument("--zmq-host", default=None, help="Override ui.zmq_host from YAML (run mode only)")
+    ap.add_argument("--zmq-port", type=int, default=None, help="Override ui.zmq_port from YAML (run mode only)")
 
     args = ap.parse_args()
     cfg_path = args.config_flag or args.config
@@ -66,10 +78,16 @@ def main() -> None:
         return
 
     if args.detach:
-        _detach_run(cfg_path, args.out_dir, args.name)
+        _detach_run(cfg_path, args.out_dir, args.name, args.zmq_host, args.zmq_port)
         return
 
-    run_once(cfg_path, out_dir_override=args.out_dir, name_override=args.name)
+    run_once(
+        cfg_path,
+        out_dir_override=args.out_dir,
+        name_override=args.name,
+        zmq_host_override=args.zmq_host,
+        zmq_port_override=args.zmq_port,
+    )
 
 if __name__ == "__main__":
     main()
