@@ -184,7 +184,7 @@ class RealTimeDashboard(QMainWindow):
         self._latest_positions: Dict[str, int] = {}
 
         # Throttles
-        self._plot_fps = 5.0
+        self._plot_fps = 2.0
         self._max_plot_points = 20000
         self._last_plot_update = 0.0
 

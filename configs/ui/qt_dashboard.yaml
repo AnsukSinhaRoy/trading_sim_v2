@@ -5,4 +5,4 @@ ui:
 
   # In FAST backtests, publishing every tick can overwhelm the UI.
   # Increase if your chart looks frozen during fast runs.
-  publish_every_ticks: 1
+  publish_every_ticks: 376

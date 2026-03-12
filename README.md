@@ -119,6 +119,11 @@ python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop_v2.yaml --zmq-port 55
 python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml --zmq-host 127.0.0.1 --zmq-port 5560
 ```
 
+### For setting the updates and FPS of the terminal:
+ui/qt_dashboard.py : self._plot_fps = 2.0
+
+configs/ui/qt_dashboard.yaml : publish_every_ticks: 376 : higher for faster simulation and the minimum is limited by your system capabilities.
+
 ### Tuning for fast backtests
 
 If the run is very fast, the UI may look frozen because the engine produces ticks faster than Qt can draw.
@@ -154,5 +159,7 @@ pytest -q
 CLI override example:
 ```bash
 python -m runner configs/run/cube_demo_ema_long.yaml --zmq-port 5560
+```
+```bashbash
 python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
 ```
