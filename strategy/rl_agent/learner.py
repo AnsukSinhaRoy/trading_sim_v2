@@ -31,6 +31,7 @@ class Learner:
         self.cfg = cfg or PPOConfig()
 
         self.updates = 0
+        self.last_stats = {}
 
     def state_dict(self):
         return {
@@ -87,7 +88,8 @@ class Learner:
         masks: List[torch.Tensor] | None = None,
     ):
         if not transitions:
-            return
+            self.last_stats = {}
+            return {}
 
         # Prepare tensors
         rewards = torch.tensor([t.reward for t in transitions], dtype=torch.float32, device=self.device)
@@ -98,11 +100,17 @@ class Learner:
         # Bootstrap value for last state (use last stored value as a cheap approx)
         values = torch.cat([old_value, old_value[-1:].clone()], dim=0)
 
-        adv, ret = self._compute_gae(rewards, values, dones)
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        adv_raw, ret = self._compute_gae(rewards, values, dones)
+        adv = (adv_raw - adv_raw.mean()) / (adv_raw.std() + 1e-8)
 
         n = len(transitions)
         idx_order = torch.arange(n, device=self.device)
+
+        policy_losses = []
+        value_losses = []
+        entropy_bonuses = []
+        total_losses = []
+        ratio_means = []
 
         for _ in range(int(self.cfg.train_epochs)):
             perm = idx_order[torch.randperm(n)]
@@ -113,7 +121,7 @@ class Learner:
                 ents = []
                 new_vals = []
 
-                for j, t_i in enumerate(mb.tolist()):
+                for t_i in mb.tolist():
                     tr = transitions[t_i]
                     X = tr.X.to(self.device)
                     a_idx = tr.idx.to(self.device)
@@ -141,6 +149,12 @@ class Learner:
 
                 loss = policy_loss + value_loss - entropy_bonus
 
+                policy_losses.append(float(policy_loss.detach().cpu().item()))
+                value_losses.append(float(value_loss.detach().cpu().item()))
+                entropy_bonuses.append(float(entropy_bonus.detach().cpu().item()))
+                total_losses.append(float(loss.detach().cpu().item()))
+                ratio_means.append(float(ratio.detach().mean().cpu().item()))
+
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.cfg.grad_clip and self.cfg.grad_clip > 0:
@@ -148,3 +162,18 @@ class Learner:
                 self.opt.step()
 
         self.updates += 1
+        self.last_stats = {
+            "updates": int(self.updates),
+            "batch_transitions": int(n),
+            "reward_mean": float(rewards.mean().detach().cpu().item()),
+            "reward_std": float(rewards.std(unbiased=False).detach().cpu().item()) if n > 1 else 0.0,
+            "adv_mean": float(adv_raw.mean().detach().cpu().item()),
+            "adv_std": float(adv_raw.std(unbiased=False).detach().cpu().item()) if n > 1 else 0.0,
+            "return_mean": float(ret.mean().detach().cpu().item()),
+            "policy_loss": float(sum(policy_losses) / max(1, len(policy_losses))),
+            "value_loss": float(sum(value_losses) / max(1, len(value_losses))),
+            "entropy_bonus": float(sum(entropy_bonuses) / max(1, len(entropy_bonuses))),
+            "total_loss": float(sum(total_losses) / max(1, len(total_losses))),
+            "ratio_mean": float(sum(ratio_means) / max(1, len(ratio_means))),
+        }
+        return dict(self.last_stats)

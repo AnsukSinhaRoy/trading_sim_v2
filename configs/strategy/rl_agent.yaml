@@ -5,7 +5,7 @@ strategy:
   corr_short: 1950
   corr_long: 23400
   min_history: 3900
-  max_assets: 10
+  max_assets: 30
   leverage: 1.0
   rebalance_every_minutes: 10080
   max_turnover: 0.6
@@ -22,8 +22,8 @@ strategy:
   vf_coef: 0.5
   ent_coef: 0.01
   train_epochs: 6
-  update_every: 16
-  batch_size: 16
+  update_every: 4
+  batch_size: 4
   temperature: 1.0
   grad_clip: 1.0
   checkpoint_enabled: true

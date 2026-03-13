@@ -8,5 +8,5 @@ run:
 modules:
   market_feed: ../market_feed/cube_feed.yaml
   execution:   ../execution/paper_fixed_bps.yaml
-  strategy:    ../strategy/xs_mom_vol_ema_stop.yaml
+  strategy:    ../strategy/rl_agent.yaml
   ui:          ../ui/qt_dashboard.yaml

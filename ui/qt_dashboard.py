@@ -59,6 +59,7 @@ class ZmqListener(QThread):
 
     nav_signal = pyqtSignal(dict)
     fills_signal = pyqtSignal(list)
+    learn_signal = pyqtSignal(dict)
 
     def __init__(self, url: str, *, max_fills_emit: int = 2000, poll_ms: int = 50, max_drain_ms: int = 15):
         super().__init__()
@@ -80,11 +81,13 @@ class ZmqListener(QThread):
         sock.connect(self.url)
         sock.setsockopt_string(zmq.SUBSCRIBE, "nav")
         sock.setsockopt_string(zmq.SUBSCRIBE, "fill")
+        sock.setsockopt_string(zmq.SUBSCRIBE, "learn")
 
         poller = zmq.Poller()
         poller.register(sock, zmq.POLLIN)
 
         latest_nav = None
+        latest_learn = None
         fills_batch: List[dict] = []
 
         def _decode(msg_b: bytes):
@@ -95,10 +98,13 @@ class ZmqListener(QThread):
                 return None
 
         def _flush():
-            nonlocal latest_nav, fills_batch
+            nonlocal latest_nav, latest_learn, fills_batch
             if latest_nav is not None:
                 self.nav_signal.emit(latest_nav)
                 latest_nav = None
+            if latest_learn is not None:
+                self.learn_signal.emit(latest_learn)
+                latest_learn = None
             if fills_batch:
                 # Emit in chunks to avoid huge cross-thread payloads.
                 n = len(fills_batch)
@@ -137,6 +143,8 @@ class ZmqListener(QThread):
                         latest_nav = data
                     elif topic == "fill":
                         fills_batch.append(data)
+                    elif topic == "learn":
+                        latest_learn = data
 
                 _flush()
         finally:
@@ -161,6 +169,7 @@ class RealTimeDashboard(QMainWindow):
         self.nav_x: List[float] = []   # dense integer index for plotting
         self.nav_dt: List[datetime] = []  # timestamp labels for DenseTimeAxis
         self._latest_nav = None
+        self._latest_learning = None
         self._initial_nav = None
 
         # Fill pipeline
@@ -200,6 +209,7 @@ class RealTimeDashboard(QMainWindow):
         self.listener = ZmqListener(self.url)
         self.listener.nav_signal.connect(self.handle_nav_update)
         self.listener.fills_signal.connect(self.handle_fills_update)
+        self.listener.learn_signal.connect(self.handle_learning_update)
         self.listener.start()
 
         # UI flush timer (smooth updates even with bursty data)
@@ -219,11 +229,13 @@ class RealTimeDashboard(QMainWindow):
         self.lbl_cash = self.create_stat_label("Cash: -")
         self.lbl_pnl = self.create_stat_label("PnL: -")
         self.lbl_ts = self.create_stat_label("TS: -")
+        self.lbl_learning = self.create_stat_label("Learning: -")
 
         stats_layout.addWidget(self.lbl_nav)
         stats_layout.addWidget(self.lbl_cash)
         stats_layout.addWidget(self.lbl_pnl)
         stats_layout.addWidget(self.lbl_ts)
+        stats_layout.addWidget(self.lbl_learning)
         layout.addLayout(stats_layout)
 
         # 2. Tabs
@@ -264,6 +276,26 @@ class RealTimeDashboard(QMainWindow):
         self.fills_table = self.create_table(["Time", "Symbol", "Side", "Qty", "Price", "Fees"])
         fills_layout.addWidget(self.fills_table)
         self._fills_tab_index = self.tabs.addTab(fills, "Fills")
+
+        # --- Learning Tab ---
+        learning = QWidget()
+        learning_layout = QVBoxLayout(learning)
+
+        self.learn_summary_lbl = QLabel("No learning telemetry received yet.")
+        self.learn_summary_lbl.setWordWrap(True)
+        self.learn_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
+        learning_layout.addWidget(self.learn_summary_lbl)
+
+        self.learn_scalars_table = self.create_table(["Metric", "Value"])
+        learning_layout.addWidget(self.learn_scalars_table)
+
+        self.learn_weights_table = self.create_table(["Bucket", "Symbol", "Weight"])
+        learning_layout.addWidget(self.learn_weights_table)
+
+        self.learn_lists_table = self.create_table(["Name", "Value"])
+        learning_layout.addWidget(self.learn_lists_table)
+
+        self._learning_tab_index = self.tabs.addTab(learning, "Learning")
 
         # --- PnL Tab ---
         pnl = QWidget()
@@ -331,6 +363,9 @@ class RealTimeDashboard(QMainWindow):
     # --- Listener callbacks (Qt GUI thread; keep very light) ---
     def handle_nav_update(self, data: dict):
         self._latest_nav = data
+
+    def handle_learning_update(self, data: dict):
+        self._latest_learning = data
 
     def handle_fills_update(self, fills: list):
         # Append to processing queue.
@@ -402,6 +437,10 @@ class RealTimeDashboard(QMainWindow):
 
             self._render_positions(positions, pos_values)
 
+        # 1b) Apply latest learning telemetry.
+        if self._latest_learning:
+            self._render_learning_panel(self._latest_learning)
+
         # 2) Process fills (state updates) with a time budget so we can catch up.
         backlog = len(self._fills_buffer)
         budget = 0.02
@@ -442,6 +481,76 @@ class RealTimeDashboard(QMainWindow):
         if (now - self._last_pnl_update) >= (1.0 / self._pnl_fps):
             self._last_pnl_update = now
             self._render_pnl_table()
+
+    def _fmt_metric_value(self, value) -> str:
+        if isinstance(value, float):
+            if abs(value) >= 1000:
+                return f"{value:,.2f}"
+            if abs(value) >= 1:
+                return f"{value:,.4f}"
+            return f"{value:.6f}"
+        if isinstance(value, (list, tuple)):
+            return ", ".join(str(x) for x in value)
+        if isinstance(value, dict):
+            return ", ".join(f"{k}={self._fmt_metric_value(v)}" for k, v in value.items())
+        return str(value)
+
+    def _set_two_col_rows(self, table: QTableWidget, rows):
+        table.setRowCount(0)
+        for key, value in rows:
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(str(key)))
+            table.setItem(r, 1, QTableWidgetItem(self._fmt_metric_value(value)))
+
+    def _render_learning_panel(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        strategy = str(payload.get("strategy", "-"))
+        status = str(payload.get("status", "-"))
+        ts = self._fmt_time(str(payload.get("ts", "")))
+        scalars = payload.get("scalars", {}) if isinstance(payload.get("scalars", {}), dict) else {}
+        weights = payload.get("weights", {}) if isinstance(payload.get("weights", {}), dict) else {}
+        lists = payload.get("lists", {}) if isinstance(payload.get("lists", {}), dict) else {}
+        latest_update = payload.get("latest_update", {}) if isinstance(payload.get("latest_update", {}), dict) else {}
+        blocked_until = payload.get("blocked_until", {}) if isinstance(payload.get("blocked_until", {}), dict) else {}
+
+        header_parts = [strategy]
+        if status and status != "-":
+            header_parts.append(status)
+        if ts:
+            header_parts.append(ts)
+        self.lbl_learning.setText("Learning: " + " | ".join(header_parts[:3]))
+
+        self.learn_summary_lbl.setText(
+            f"Strategy: {strategy}\n"
+            f"Status: {status}\n"
+            f"Timestamp: {ts or '-'}"
+        )
+
+        scalar_rows = sorted(scalars.items(), key=lambda kv: str(kv[0]))
+        if latest_update:
+            scalar_rows.extend((f"update::{k}", v) for k, v in sorted(latest_update.items(), key=lambda kv: str(kv[0])))
+        self._set_two_col_rows(self.learn_scalars_table, scalar_rows)
+
+        self.learn_weights_table.setRowCount(0)
+        for bucket_name, bucket in weights.items():
+            if not isinstance(bucket, dict):
+                continue
+            for sym, weight in sorted(bucket.items(), key=lambda kv: abs(float(kv[1])) if isinstance(kv[1], (int, float)) else 0.0, reverse=True):
+                r = self.learn_weights_table.rowCount()
+                self.learn_weights_table.insertRow(r)
+                self.learn_weights_table.setItem(r, 0, QTableWidgetItem(str(bucket_name)))
+                self.learn_weights_table.setItem(r, 1, QTableWidgetItem(str(sym)))
+                self.learn_weights_table.setItem(r, 2, QTableWidgetItem(self._fmt_metric_value(weight)))
+
+        list_rows = []
+        for key, value in sorted(lists.items(), key=lambda kv: str(kv[0])):
+            list_rows.append((key, value))
+        if blocked_until:
+            list_rows.append(("blocked_until", blocked_until))
+        self._set_two_col_rows(self.learn_lists_table, list_rows)
 
     def _render_positions(self, positions: dict, pos_values: dict):
         self.pos_table.setRowCount(0)

@@ -114,6 +114,12 @@ class RLAgentStrategy:
     _active_turnover: float = 0.0
     _decision_steps: int = 0
 
+    _last_reward: float = 0.0
+    _last_update_stats: Dict[str, float] = field(default_factory=dict)
+    _last_ready_symbol_count: int = 0
+    _last_ready_symbols: List[str] = field(default_factory=list)
+    _last_selected_symbols: List[str] = field(default_factory=list)
+
     # Stoploss tracking
     _blocked_until: Dict[str, object] = field(default_factory=dict)  # sym -> datetime
     _peak_price: Dict[str, float] = field(default_factory=dict)
@@ -296,6 +302,7 @@ class RLAgentStrategy:
             vol_penalty=float(self.vol_penalty),
             dd_penalty=float(self.dd_penalty),
         )
+        self._last_reward = float(r)
         self._buffer.add(
             Transition(
                 X=self._active_X,
@@ -316,12 +323,64 @@ class RLAgentStrategy:
         if len(self._buffer) >= int(self.update_every):
             self._buffer.mark_last_done()
             trans = self._buffer.get()
-            self._learner.ppo_update(trans, temperature=float(self.temperature))
+            self._last_update_stats = self._learner.ppo_update(trans, temperature=float(self.temperature)) or {}
             self._buffer.clear()
 
         self._decision_steps += 1
         if self.checkpoint_enabled and (self._decision_steps % max(1, int(self.checkpoint_every_steps)) == 0):
             self._save_checkpoint()
+
+    def get_dashboard_metrics(self, snap: MarketSnapshot | None = None, portfolio: PositionSnapshot | None = None) -> Dict[str, object]:
+        target_weights = {
+            str(sym): float(wt)
+            for sym, wt in sorted((self._last_target_weights or {}).items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:10]
+        }
+        hold_weights = {
+            str(sym): float(wt)
+            for sym, wt in sorted((self._hold_weights or {}).items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:10]
+        }
+        blocked_preview = {
+            str(sym): str(until)
+            for sym, until in sorted((self._blocked_until or {}).items(), key=lambda kv: str(kv[0]))[:10]
+        }
+        update_stats = {str(k): float(v) if isinstance(v, (int, float)) else v for k, v in (self._last_update_stats or {}).items()}
+
+        return {
+            "mode": "online_learning",
+            "strategy": self.__class__.__name__,
+            "status": f"decisions={self._decision_steps} | updates={getattr(self._learner, 'updates', 0)} | buffer={len(self._buffer)}/{int(self.update_every)}",
+            "scalars": {
+                "decision_steps": int(self._decision_steps),
+                "learner_updates": int(getattr(self._learner, 'updates', 0)),
+                "buffer_size": int(len(self._buffer)),
+                "update_every": int(self.update_every),
+                "last_reward": float(self._last_reward),
+                "seg_cum_logret": float(self._seg_cum_lr),
+                "active_turnover": float(self._active_turnover),
+                "active_value": float(self._active_value),
+                "ready_symbols": int(self._last_ready_symbol_count),
+                "selected_symbols": int(len(self._last_selected_symbols)),
+                "holding_symbols": int(len(self._hold_weights)),
+                "blocked_symbols": int(len(self._blocked_until)),
+                "rebalance_every_minutes": int(self.rebalance_every_minutes),
+                "max_assets": int(self.max_assets),
+                "temperature": float(self.temperature),
+                "lr": float(self.lr),
+                "stoploss_pct": float(self.stoploss_pct),
+                "max_turnover": float(self.max_turnover),
+            },
+            "lists": {
+                "selected_symbols": list(self._last_selected_symbols[:12]),
+                "ready_sample": list(self._last_ready_symbols[:12]),
+                "blocked_symbols": list(sorted(self._blocked_until.keys())[:12]),
+            },
+            "weights": {
+                "target": target_weights,
+                "hold": hold_weights,
+            },
+            "latest_update": update_stats,
+            "blocked_until": blocked_preview,
+        }
 
     def on_snapshot(self, snap: MarketSnapshot, portfolio: PositionSnapshot):
         # Update features first
@@ -349,7 +408,10 @@ class RLAgentStrategy:
         # 5) Build universe & filter
         symbols = self._encoder.ready_symbols(min_len=int(self.min_history))
         symbols = self._allowed_symbols(snap.ts, symbols)
+        self._last_ready_symbol_count = int(len(symbols))
+        self._last_ready_symbols = list(symbols[:50])
         if len(symbols) < 2:
+            self._last_selected_symbols = []
             # keep existing weights
             return []
 
@@ -366,6 +428,8 @@ class RLAgentStrategy:
             return []
 
         idx, logp_sel, ent_sel = sample_without_replacement(probs, k)
+        idx_list = idx.detach().cpu().tolist()
+        self._last_selected_symbols = [symbols[i] for i in idx_list]
 
         # Dirichlet for weights (long-only, sum to 1 over selected)
         alpha_sel = alpha.gather(0, idx)
@@ -377,7 +441,7 @@ class RLAgentStrategy:
 
         # Build weight dict (scaled by leverage)
         target_sum = min(float(self.leverage), 1.0)
-        w_new = {symbols[i]: float(w_sel[j].detach().cpu()) * target_sum for j, i in enumerate(idx.detach().cpu().tolist())}
+        w_new = {symbols[i]: float(w_sel[j].detach().cpu()) * target_sum for j, i in enumerate(idx_list)}
         w_new = self._renorm_long_only(w_new)
 
         w_old = self._last_target_weights or {}
