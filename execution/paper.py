@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 from datetime import datetime
+import math
 import uuid
 
 from common.events import MarketSnapshot, OrderRequest, OrderAck, FillEvent, PositionSnapshot, TradeOpen, TradeClose
@@ -13,6 +14,7 @@ class PaperExecutionEngine:
     initial_cash: float
     slippage_bps: float = 0.0
     fees_bps: float = 0.0
+    min_price: float = 1.0
 
     def __post_init__(self):
         self.portfolio = Portfolio(cash=float(self.initial_cash), positions={})
@@ -31,10 +33,20 @@ class PaperExecutionEngine:
         By updating in place, we carry forward the last known price for symbols that are
         temporarily absent, which keeps minute-level mark-to-market stable while still
         letting order generation rely on the current snapshot (`snap.prices`).
+
+        Also ignore non-finite, zero, and effectively-dead quotes instead of allowing
+        them to overwrite the last good market price. This prevents accidental fills at
+        Rs.0 / near-Rs.0 when the data store contains placeholder or corrupt values.
         """
         if not snap.prices:
             return
-        self.last_prices.update({sym: float(px) for sym, px in snap.prices.items()})
+        good_prices = {
+            sym: float(px)
+            for sym, px in snap.prices.items()
+            if math.isfinite(float(px)) and float(px) > float(self.min_price)
+        }
+        if good_prices:
+            self.last_prices.update(good_prices)
 
     def place_orders(self, ts: datetime, orders: List[OrderRequest]) -> List[dict]:
         events: List[dict] = []
@@ -47,6 +59,9 @@ class PaperExecutionEngine:
                 continue
 
             ref_price = float(self.last_prices[o.symbol])
+            if not (math.isfinite(ref_price) and ref_price > float(self.min_price)):
+                events.append(OrderAck(ts=ts, order_id=o.order_id, accepted=False, reason="invalid_market_price").model_dump())
+                continue
             exec_price = float(self.slippage.apply(o.side, ref_price))
             notional = exec_price * o.qty
             fee = float(self.fees.fee(notional))

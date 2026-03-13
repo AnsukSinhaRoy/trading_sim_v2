@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Literal
-import json
+import math
 
 import pandas as pd
 
@@ -26,6 +26,7 @@ class MatrixStoreMinuteFeed:
     end: datetime
     symbols: Optional[List[str]] = None   # optional subset
     speed: Literal["fast", "realtime"] = "fast"
+    min_price: float = 1.0
 
     async def stream(self) -> AsyncIterator[MarketSnapshot]:
         root = Path(self.store_dir)
@@ -60,7 +61,10 @@ class MatrixStoreMinuteFeed:
                     v = row[sym]
                     if pd.isna(v):
                         continue
-                    prices[sym] = float(v)
+                    px = float(v)
+                    if not (math.isfinite(px) and px > float(self.min_price)):
+                        continue
+                    prices[sym] = px
                 yield MarketSnapshot(ts=ts, prices=prices)
 
                 if self.speed == "realtime":

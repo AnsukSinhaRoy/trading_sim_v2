@@ -1,5 +1,5 @@
 market_feed:
-  type: matrix_store_1m
+  type: sanitized_matrix_store_1m
 
   # IMPORTANT: point to the cube store root
   store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired_v2"
@@ -14,3 +14,8 @@ market_feed:
 
   # Optional: if supported by your feed, you can restrict symbols
   # symbols: ["reliance", "tcs"]
+
+  # Guardrail: ignore dead / placeholder / corrupt quotes at or below this price.
+  # This prevents absurd share quantities when a bad bar comes through as Rs.0.
+  min_price: 1.0
+  max_abs_return: 0.35

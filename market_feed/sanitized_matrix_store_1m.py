@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Literal
+import math
 
 import pandas as pd
 
@@ -33,7 +34,7 @@ class SanitizedMatrixStoreMinuteFeed:
     symbols: Optional[List[str]] = None
     speed: Literal['fast', 'realtime'] = 'fast'
     max_abs_return: float = 0.35
-    min_price: float = 1e-9
+    min_price: float = 1.0
     stats_every_rows: int = 0
 
     async def stream(self) -> AsyncIterator[MarketSnapshot]:
@@ -72,7 +73,7 @@ class SanitizedMatrixStoreMinuteFeed:
                     if pd.isna(v):
                         continue
                     px = float(v)
-                    if not (px > self.min_price):
+                    if not (math.isfinite(px) and px > float(self.min_price)):
                         rejected += 1
                         continue
 

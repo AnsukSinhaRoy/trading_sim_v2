@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     # Only needed for type checkers / IDE intellisense.
     from common.events import FillEvent, OrderAck, TradeOpen, TradeClose
 from execution.paper import PaperExecutionEngine
-from market_feed import SyntheticMinuteFeed, FolderMinuteFeed, MatrixStoreMinuteFeed
+from market_feed import SyntheticMinuteFeed, FolderMinuteFeed, MatrixStoreMinuteFeed, SanitizedMatrixStoreMinuteFeed
 from analytics.build import build_derived_from_events
 
 # --- ZMQ Publisher Class ---
@@ -145,6 +145,30 @@ def _make_feed(cfg: Config):
             end=end_dt,
             symbols=cfg.get("market_feed","symbols", default=None),
             speed=cfg.get("market_feed","speed", default="fast"),
+            min_price=float(cfg.get("market_feed", "min_price", default=1.0)),
+        )
+
+    if ftype == "sanitized_matrix_store_1m":
+        start = parse_dt(cfg.get("market_feed","start"))
+        end = cfg.get("market_feed","end", default=None)
+        minutes = cfg.get("market_feed","minutes", default=None)
+        if end is None and minutes is None:
+            raise ValueError("sanitized_matrix_store_1m requires either market_feed.end or market_feed.minutes")
+        if end is None and minutes is not None:
+            from datetime import timedelta
+            end_dt = start + timedelta(minutes=int(minutes))
+        else:
+            end_dt = parse_dt(end)
+
+        return SanitizedMatrixStoreMinuteFeed(
+            store_dir=cfg.get("market_feed","store_dir"),
+            start=start,
+            end=end_dt,
+            symbols=cfg.get("market_feed","symbols", default=None),
+            speed=cfg.get("market_feed","speed", default="fast"),
+            max_abs_return=float(cfg.get("market_feed", "max_abs_return", default=0.35)),
+            min_price=float(cfg.get("market_feed", "min_price", default=1.0)),
+            stats_every_rows=int(cfg.get("market_feed", "stats_every_rows", default=0)),
         )
 
     raise ValueError(f"Unsupported market_feed.type: {ftype}")
@@ -154,6 +178,7 @@ def _make_execution(cfg: Config):
         initial_cash=float(cfg.get("execution","initial_cash", default=1_000_000)),
         slippage_bps=float(cfg.get("execution","slippage","bps", default=0)),
         fees_bps=float(cfg.get("execution","fees","bps", default=0)),
+        min_price=float(cfg.get("execution", "min_price", default=1.0)),
     )
 
 _ACRONYMS = {
@@ -354,18 +379,23 @@ def _extract_strategy_telemetry(strat, snap: MarketSnapshot, port: PositionSnaps
     return payload
 
 
-def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: PositionSnapshot) -> List[OrderRequest]:
+def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: PositionSnapshot, min_price: float = 1.0) -> List[OrderRequest]:
     prices = snap.prices
     nav = float(port.nav)
     cash = float(port.cash)
     cur_pos = dict(port.positions)
-    desired_notional = {sym: float(w) * nav for sym, w in target_w.items()}
+    desired_notional = {
+        sym: float(w) * nav
+        for sym, w in target_w.items()
+        if math.isfinite(float(w)) and float(w) > 0.0
+    }
     orders: List[OrderRequest] = []
 
     # Sell logic
     for sym, qty in cur_pos.items():
         px = float(prices.get(sym, 0.0))
-        if px <= 0: continue
+        if not (math.isfinite(px) and px > float(min_price)):
+            continue
         cur_val = qty * px
         tgt_val = desired_notional.get(sym, 0.0)
         if cur_val > tgt_val + 1e-9:
@@ -376,12 +406,13 @@ def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: Posit
 
     # Buy logic
     remaining = cash
-    for sym, w in sorted(target_w.items(), key=lambda kv: kv[1], reverse=True):
+    for sym, w in sorted(desired_notional.items(), key=lambda kv: kv[1], reverse=True):
         px = float(prices.get(sym, 0.0))
-        if px <= 0: continue
+        if not (math.isfinite(px) and px > float(min_price)):
+            continue
         qty = int(cur_pos.get(sym, 0))
         cur_val = qty * px
-        tgt_val = desired_notional.get(sym, 0.0)
+        tgt_val = float(w)
         if cur_val + 1e-9 >= tgt_val: continue
         buy_val = tgt_val - cur_val
         buy_qty = int(math.floor(buy_val / px))
@@ -492,7 +523,7 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                 orders: List[OrderRequest] = []
                 target_w = getattr(strat, "_last_target_weights", None)
                 if isinstance(target_w, dict) and target_w:
-                    orders = _rebalance(event.ts, target_w, event, port)
+                    orders = _rebalance(event.ts, target_w, event, port, min_price=float(exe.min_price))
                     
                     if orders:
                         logger.append_many(orders)

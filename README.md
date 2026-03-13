@@ -114,7 +114,7 @@ python ui/qt_dashboard.py --url tcp://127.0.0.1:5555
 ### Run an experiment
 
 ```bash
-python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml
+python -m runner configs/run/cube_demo.yaml
 python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop_v2.yaml --zmq-port 5560
 python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml --zmq-host 127.0.0.1 --zmq-port 5560
 ```

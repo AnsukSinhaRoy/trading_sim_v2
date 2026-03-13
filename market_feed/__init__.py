@@ -1,3 +1,4 @@
 from .synthetic import SyntheticMinuteFeed
 from .folder_1m import FolderMinuteFeed
 from .matrix_store_1m import MatrixStoreMinuteFeed
+from .sanitized_matrix_store_1m import SanitizedMatrixStoreMinuteFeed
