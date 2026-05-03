@@ -1,0 +1,89 @@
+# End-to-end GDFL -> long parquet store -> cube store
+# Usage:
+#   set GDFL_BASE_URL=http://your-endpoint:port/
+#   set GDFL_ACCESS_KEY=your_api_key
+#   python -m preprocess --config configs/preprocess/gdfl_nifty500_cube.yaml
+#
+# IMPORTANT:
+# - universe_file should be a JSON array of symbols. The matcher accepts any of:
+#   engine symbol alias, GDFL IDENTIFIER, or GDFL TRADESYMBOL.
+# - For historical backtests, GetHistoryAfterMarket is safer than GetHistory because
+#   it is designed for backtesting / previous working day snapshots.
+# - If you want the entire NSE EQ universe instead of a filtered universe file,
+#   set universe_file: null
+
+task: preprocess
+
+preprocess:
+  source: gdfl
+  dataset_name: nifty500_gdfl
+  out_dir: processed_data
+
+  # Build all matrices, not just close
+  fields: ["open", "high", "low", "close", "volume"]
+
+  # Required for GDFL source
+  start: "2016-01-01 00:00:00"
+  end:   "2026-03-13 23:59:59"
+
+  market_start: "09:15:00"
+  market_end: "15:30:00"
+  freq: "1min"
+
+  # Optional filter. Recommended: maintain rebalance-date snapshots yourself to avoid survivorship bias.
+  universe_file: null
+
+  mode: cube
+  cleanup_long_store: false
+  progress_every_days: 10
+  log_level: INFO
+
+  fill_rules:
+    close: "ffill"
+    open: "from_close"
+    high: "from_close"
+    low: "from_close"
+    volume: "zero"
+
+  gdfl:
+    # Prefer env vars so secrets do not land in YAML / git.
+    base_url_env: "GDFL_BASE_URL"
+    access_key_env: "GDFL_ACCESS_KEY"
+
+    exchange: "NSE"
+    series: "EQ"
+
+    # For backtesting/offline rebuilds, this is the better default.
+    history_function: "GetHistoryAfterMarket"
+    periodicity: "MINUTE"
+    period: 1
+
+    # Leave null to infer from GetLimitation.HistoryLimitation.MaxIntraday when available.
+    chunk_days: null
+
+    adjust_splits: true
+    is_short_identifier: false
+    max_records: 0
+
+    # Instrument discovery controls
+    detailed_instruments: true
+    only_active: true
+    show_dummy_isin: false
+    show_etf: false
+    show_interoperable: false
+
+    # How symbols will look inside your engine / cube columns.
+    # IDENTIFIER + lower keeps things simple and stable for cash equities.
+    symbol_field: "IDENTIFIER"
+    symbol_transform: "lower"
+    instrument_identifier_field: "IDENTIFIER"
+
+    timezone: "Asia/Kolkata"
+    drop_nonpositive_bars: true
+    skip_existing: true
+
+    timeout_sec: 60
+    retry_attempts: 5
+    poll_attempts: 20
+    poll_delay_sec: 1.0
+    request_pause_sec: 0.25

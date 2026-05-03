@@ -1,0 +1,12 @@
+run:
+  name: sparse_switch_mv_synth
+  out_dir: runs
+  seed: 7
+  log_level: INFO
+  progress_every_ticks: 375
+
+modules:
+  market_feed: ../market_feed/synth_1m.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/sparse_switch_mv.yaml
+  ui:          ../ui/qt_dashboard.yaml

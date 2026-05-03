@@ -1,6 +1,5 @@
 execution:
   initial_cash: 1000000
-  min_price: 1.0
   slippage:
     model: fixed_bps
     bps: 3

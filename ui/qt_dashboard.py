@@ -172,6 +172,30 @@ class RealTimeDashboard(QMainWindow):
         self._latest_learning = None
         self._initial_nav = None
 
+        # Live backtest analytics state. Metrics are computed from received NAV
+        # snapshots, so the numbers update online and do not depend on post-run
+        # analytics files. Risk-free rate is fixed at 4% annualized as requested.
+        self._risk_free_rate_annual = 0.04
+        self._nav_returns: List[float] = []
+        self._drawdown_x: List[float] = []
+        self._drawdown_y: List[float] = []
+        self._last_metrics_update = 0.0
+        self._metrics_fps = 2.0
+
+        # Online-learning plot state. True regret needs strategy/oracle telemetry.
+        # The dashboard records it when scalars such as regret/cum_regret are
+        # published on the `learn` topic; otherwise the plot stays explicit about
+        # the missing oracle signal instead of faking it.
+        self._ol_x: List[float] = []
+        self._ol_regret_y: List[float] = []
+        self._ol_cum_regret_y: List[float] = []
+        self._ol_aux_x: List[float] = []
+        self._ol_reward_y: List[float] = []
+        self._ol_loss_y: List[float] = []
+        self._last_learning_key = None
+        self._last_ol_plot_update = 0.0
+        self._ol_plot_fps = 2.0
+
         # Fill pipeline
         self._fills_buffer = deque()            # raw fills waiting to be processed
         self._recent_fills = deque(maxlen=50)   # for Overview moving rows
@@ -263,6 +287,35 @@ class RealTimeDashboard(QMainWindow):
         ov_layout.addWidget(self.ov_fills_table)
         self._overview_tab_index = self.tabs.addTab(overview, "Overview")
 
+        # --- Backtest Metrics Tab ---
+        metrics = QWidget()
+        metrics_layout = QVBoxLayout(metrics)
+
+        self.metrics_summary_lbl = QLabel(
+            "Backtest metrics will appear after at least two NAV snapshots. "
+            "Sharpe/Sortino use a fixed 4% annual risk-free rate."
+        )
+        self.metrics_summary_lbl.setWordWrap(True)
+        self.metrics_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
+        metrics_layout.addWidget(self.metrics_summary_lbl)
+
+        metrics_splitter = QSplitter()
+        metrics_splitter.setOrientation(Qt.Orientation.Vertical)
+
+        self.metrics_table = self.create_table(["Metric", "Value", "Notes"])
+        metrics_splitter.addWidget(self.metrics_table)
+
+        dd_axis = DenseTimeAxis(self._get_nav_dt, orientation="bottom")
+        self.drawdown_plot = pg.PlotWidget(axisItems={"bottom": dd_axis})
+        self.drawdown_plot.setBackground("#1e1e1e")
+        self.drawdown_plot.setTitle("Drawdown", color="#dcdcdc")
+        self.drawdown_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.drawdown_curve = self.drawdown_plot.plot(pen=pg.mkPen(color="#ff6b6b", width=2))
+        metrics_splitter.addWidget(self.drawdown_plot)
+
+        metrics_layout.addWidget(metrics_splitter)
+        self._metrics_tab_index = self.tabs.addTab(metrics, "Backtest Metrics")
+
         # --- Positions Tab ---
         positions = QWidget()
         pos_layout = QVBoxLayout(positions)
@@ -277,25 +330,58 @@ class RealTimeDashboard(QMainWindow):
         fills_layout.addWidget(self.fills_table)
         self._fills_tab_index = self.tabs.addTab(fills, "Fills")
 
-        # --- Learning Tab ---
+        # --- Online Learning Tab ---
         learning = QWidget()
         learning_layout = QVBoxLayout(learning)
 
-        self.learn_summary_lbl = QLabel("No learning telemetry received yet.")
+        self.learn_summary_lbl = QLabel(
+            "No learning telemetry received yet. Regret plots require the strategy "
+            "to publish regret/cum_regret or loss/oracle_loss in learn.scalars."
+        )
         self.learn_summary_lbl.setWordWrap(True)
         self.learn_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
         learning_layout.addWidget(self.learn_summary_lbl)
 
+        learning_splitter = QSplitter()
+        learning_splitter.setOrientation(Qt.Orientation.Vertical)
+
+        self.ol_regret_plot = pg.PlotWidget()
+        self.ol_regret_plot.setBackground("#1e1e1e")
+        self.ol_regret_plot.setTitle("Online Regret", color="#dcdcdc")
+        self.ol_regret_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.ol_regret_curve = self.ol_regret_plot.plot(
+            name="regret", pen=pg.mkPen(color="#ffd166", width=2)
+        )
+        self.ol_cum_regret_curve = self.ol_regret_plot.plot(
+            name="cum_regret", pen=pg.mkPen(color="#06d6a0", width=2)
+        )
+        self.ol_regret_plot.addLegend()
+        learning_splitter.addWidget(self.ol_regret_plot)
+
+        self.ol_aux_plot = pg.PlotWidget()
+        self.ol_aux_plot.setBackground("#1e1e1e")
+        self.ol_aux_plot.setTitle("Learning Reward / Loss", color="#dcdcdc")
+        self.ol_aux_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.ol_reward_curve = self.ol_aux_plot.plot(
+            name="reward", pen=pg.mkPen(color="#00d4ff", width=2)
+        )
+        self.ol_loss_curve = self.ol_aux_plot.plot(
+            name="loss", pen=pg.mkPen(color="#ef476f", width=2)
+        )
+        self.ol_aux_plot.addLegend()
+        learning_splitter.addWidget(self.ol_aux_plot)
+
         self.learn_scalars_table = self.create_table(["Metric", "Value"])
-        learning_layout.addWidget(self.learn_scalars_table)
+        learning_splitter.addWidget(self.learn_scalars_table)
 
         self.learn_weights_table = self.create_table(["Bucket", "Symbol", "Weight"])
-        learning_layout.addWidget(self.learn_weights_table)
+        learning_splitter.addWidget(self.learn_weights_table)
 
         self.learn_lists_table = self.create_table(["Name", "Value"])
-        learning_layout.addWidget(self.learn_lists_table)
+        learning_splitter.addWidget(self.learn_lists_table)
 
-        self._learning_tab_index = self.tabs.addTab(learning, "Learning")
+        learning_layout.addWidget(learning_splitter)
+        self._learning_tab_index = self.tabs.addTab(learning, "Online Learning")
 
         # --- PnL Tab ---
         pnl = QWidget()
@@ -414,13 +500,22 @@ class RealTimeDashboard(QMainWindow):
             if dt is None:
                 dt = datetime.now()
             self.nav_dt.append(dt)
+            if self.nav_data:
+                prev_nav = float(self.nav_data[-1])
+                if prev_nav > 0.0 and math.isfinite(prev_nav) and math.isfinite(nav):
+                    self._nav_returns.append((nav / prev_nav) - 1.0)
             self.nav_data.append(nav)
+            self._update_drawdown_series()
 
             # Throttled + downsampled redraw.
             if (now - self._last_plot_update) >= (1.0 / self._plot_fps):
                 self._last_plot_update = now
                 xs, ys = self._nav_plot_series()
                 self.nav_curve.setData(xs, ys)
+
+            if (now - self._last_metrics_update) >= (1.0 / self._metrics_fps):
+                self._last_metrics_update = now
+                self._render_backtest_metrics()
 
             # Positions & marks from NAV packet
             positions = self._latest_nav.get("positions", {}) if isinstance(self._latest_nav, dict) else {}
@@ -437,9 +532,14 @@ class RealTimeDashboard(QMainWindow):
 
             self._render_positions(positions, pos_values)
 
+            # Mark this NAV packet consumed. Without this, the UI timer would
+            # duplicate the same NAV snapshot and corrupt online metrics.
+            self._latest_nav = None
+
         # 1b) Apply latest learning telemetry.
         if self._latest_learning:
             self._render_learning_panel(self._latest_learning)
+            self._latest_learning = None
 
         # 2) Process fills (state updates) with a time budget so we can catch up.
         backlog = len(self._fills_buffer)
@@ -482,6 +582,293 @@ class RealTimeDashboard(QMainWindow):
             self._last_pnl_update = now
             self._render_pnl_table()
 
+    def _finite_float(self, value, default=None):
+        try:
+            v = float(value)
+        except Exception:
+            return default
+        if not math.isfinite(v):
+            return default
+        return v
+
+    def _estimate_periods_per_year(self) -> float:
+        """Estimate annualization factor from received NAV timestamps.
+
+        For 1-minute Indian cash-market data this settles near 252*375=94,500
+        periods/year. If timestamps are sparse, the median positive intraday
+        spacing makes the estimate robust to overnight/weekend gaps.
+        """
+        if len(self.nav_dt) < 2:
+            return 252.0 * 375.0
+
+        diffs = []
+        for a, b in zip(self.nav_dt[:-1], self.nav_dt[1:]):
+            try:
+                sec = (b - a).total_seconds()
+            except Exception:
+                continue
+            if sec > 0:
+                diffs.append(float(sec))
+        if not diffs:
+            return 252.0 * 375.0
+
+        intraday = [d for d in diffs if d <= 6.5 * 3600.0]
+        use = intraday if intraday else diffs
+        use = sorted(use)
+        med = use[len(use) // 2]
+        if med <= 0:
+            return 252.0 * 375.0
+
+        trading_seconds_per_year = 252.0 * 375.0 * 60.0
+        ppy = trading_seconds_per_year / med
+        return max(1.0, min(1_000_000.0, ppy))
+
+    def _elapsed_years(self) -> float:
+        if len(self.nav_dt) >= 2:
+            try:
+                seconds = (self.nav_dt[-1] - self.nav_dt[0]).total_seconds()
+                if seconds > 0:
+                    return max(seconds / (365.25 * 24.0 * 3600.0), 1e-9)
+            except Exception:
+                pass
+        ppy = self._estimate_periods_per_year()
+        return max(float(len(self._nav_returns)) / ppy, 1e-9)
+
+    def _std(self, values: List[float], sample: bool = True) -> float:
+        vals = [float(x) for x in values if math.isfinite(float(x))]
+        n = len(vals)
+        if n <= (1 if sample else 0):
+            return 0.0
+        mean = sum(vals) / n
+        denom = (n - 1) if sample and n > 1 else n
+        return math.sqrt(sum((x - mean) ** 2 for x in vals) / float(max(1, denom)))
+
+    def _quantile(self, values: List[float], q: float):
+        vals = sorted(float(x) for x in values if math.isfinite(float(x)))
+        if not vals:
+            return None
+        q = max(0.0, min(1.0, float(q)))
+        pos = (len(vals) - 1) * q
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return vals[lo]
+        frac = pos - lo
+        return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+    def _fmt_pct(self, value) -> str:
+        v = self._finite_float(value)
+        if v is None:
+            return "-"
+        return f"{100.0 * v:,.2f}%"
+
+    def _fmt_num(self, value, digits: int = 4) -> str:
+        v = self._finite_float(value)
+        if v is None:
+            return "-"
+        if abs(v) >= 1000:
+            return f"{v:,.2f}"
+        return f"{v:,.{digits}f}"
+
+    def _set_three_col_rows(self, table: QTableWidget, rows):
+        table.setRowCount(0)
+        for key, value, note in rows:
+            r = table.rowCount()
+            table.insertRow(r)
+            table.setItem(r, 0, QTableWidgetItem(str(key)))
+            table.setItem(r, 1, QTableWidgetItem(str(value)))
+            table.setItem(r, 2, QTableWidgetItem(str(note)))
+
+    def _update_drawdown_series(self) -> None:
+        if not self.nav_data:
+            return
+        peak = -float("inf")
+        xs = []
+        ys = []
+        for i, nav in enumerate(self.nav_data):
+            if not math.isfinite(float(nav)) or float(nav) <= 0.0:
+                continue
+            peak = max(peak, float(nav))
+            dd = (float(nav) / peak) - 1.0 if peak > 0.0 else 0.0
+            xs.append(float(i))
+            ys.append(float(dd))
+        self._drawdown_x = xs
+        self._drawdown_y = ys
+
+    def _tail_risk(self, returns: List[float], confidence: float):
+        vals = sorted(float(x) for x in returns if math.isfinite(float(x)))
+        if not vals:
+            return None, None
+        alpha = 1.0 - float(confidence)
+        q = self._quantile(vals, alpha)
+        if q is None:
+            return None, None
+        tail_count = max(1, int(math.ceil(alpha * len(vals))))
+        tail = vals[:tail_count]
+        cvar_ret = sum(tail) / float(len(tail)) if tail else q
+        # Report VaR/CVaR as positive loss fractions. A negative value would mean
+        # the observed lower tail was still profitable, so clamp at zero.
+        return max(0.0, -float(q)), max(0.0, -float(cvar_ret))
+
+    def _render_backtest_metrics(self) -> None:
+        if not hasattr(self, "metrics_table"):
+            return
+        if len(self.nav_data) < 2:
+            return
+
+        initial_nav = float(self.nav_data[0])
+        latest_nav = float(self.nav_data[-1])
+        returns = [r for r in self._nav_returns if math.isfinite(float(r))]
+        ppy = self._estimate_periods_per_year()
+        years = self._elapsed_years()
+        rf_period = (1.0 + self._risk_free_rate_annual) ** (1.0 / ppy) - 1.0 if ppy > 1 else self._risk_free_rate_annual
+
+        total_return = (latest_nav / initial_nav - 1.0) if initial_nav > 0 else 0.0
+        cagr = ((latest_nav / initial_nav) ** (1.0 / years) - 1.0) if initial_nav > 0 and years > 0 else 0.0
+
+        avg_ret = sum(returns) / float(len(returns)) if returns else 0.0
+        excess = [r - rf_period for r in returns]
+        avg_excess = sum(excess) / float(len(excess)) if excess else 0.0
+        vol = self._std(returns, sample=True)
+        ann_vol = vol * math.sqrt(ppy) if vol > 0 else 0.0
+        sharpe = (math.sqrt(ppy) * avg_excess / vol) if vol > 0 else None
+
+        downside = [min(0.0, r - rf_period) for r in returns]
+        downside_dev = math.sqrt(sum(x * x for x in downside) / float(len(downside))) if downside else 0.0
+        ann_downside = downside_dev * math.sqrt(ppy) if downside_dev > 0 else 0.0
+        sortino = (math.sqrt(ppy) * avg_excess / downside_dev) if downside_dev > 0 else None
+
+        max_dd = min(self._drawdown_y) if self._drawdown_y else 0.0
+        current_dd = self._drawdown_y[-1] if self._drawdown_y else 0.0
+        calmar = (cagr / abs(max_dd)) if max_dd < 0 else None
+
+        hit_rate = (sum(1 for r in returns if r > 0.0) / float(len(returns))) if returns else 0.0
+        best_ret = max(returns) if returns else 0.0
+        worst_ret = min(returns) if returns else 0.0
+        ann_mean_return = avg_ret * ppy
+
+        var90, cvar90 = self._tail_risk(returns, 0.90)
+        var99, cvar99 = self._tail_risk(returns, 0.99)
+
+        gross_exposure = 0.0
+        latest_pos_count = 0
+        if isinstance(self._latest_nav, dict):
+            pos_values = self._latest_nav.get("pos_values", {}) or {}
+            positions = self._latest_nav.get("positions", {}) or {}
+            gross_exposure = sum(abs(float(v)) for v in pos_values.values() if self._finite_float(v) is not None)
+            latest_pos_count = sum(1 for q in positions.values() if self._finite_float(q, 0.0))
+        cash = 0.0
+        if isinstance(self._latest_nav, dict):
+            cash = self._finite_float(self._latest_nav.get("cash", 0.0), 0.0) or 0.0
+        gross_exposure_pct = gross_exposure / latest_nav if latest_nav > 0.0 else 0.0
+        cash_pct = cash / latest_nav if latest_nav > 0.0 else 0.0
+
+        rows = [
+            ("NAV observations", f"{len(self.nav_data):,}", "Received dashboard samples"),
+            ("Start NAV", f"{initial_nav:,.2f}", self._fmt_time(self.nav_dt[0].isoformat()) if self.nav_dt else ""),
+            ("Latest NAV", f"{latest_nav:,.2f}", self._fmt_time(self.nav_dt[-1].isoformat()) if self.nav_dt else ""),
+            ("Total Return", self._fmt_pct(total_return), "Latest NAV / Start NAV - 1"),
+            ("CAGR / Annualized Return", self._fmt_pct(cagr), "Calendar-time compounded growth"),
+            ("Annualized Mean Return", self._fmt_pct(ann_mean_return), "Arithmetic mean of sampled returns × periods/year"),
+            ("Annualized Volatility", self._fmt_pct(ann_vol), "Std(sample returns) × sqrt(periods/year)"),
+            ("Sharpe", self._fmt_num(sharpe), "Annual risk-free rate = 4%"),
+            ("Sortino", self._fmt_num(sortino), "Downside deviation vs 4% risk-free"),
+            ("Max Drawdown", self._fmt_pct(max_dd), "Worst peak-to-trough NAV fall"),
+            ("Current Drawdown", self._fmt_pct(current_dd), "Latest NAV below running peak"),
+            ("Calmar", self._fmt_num(calmar), "CAGR / |Max Drawdown|"),
+            ("Hit Rate", self._fmt_pct(hit_rate), "Fraction of positive sampled returns"),
+            ("Best Sample Return", self._fmt_pct(best_ret), "Best NAV-to-NAV sample"),
+            ("Worst Sample Return", self._fmt_pct(worst_ret), "Worst NAV-to-NAV sample"),
+            ("Average Sample Return", self._fmt_pct(avg_ret), "Mean NAV-to-NAV sample"),
+            ("VaR 90%", self._fmt_pct(var90), "Observed periodic loss quantile"),
+            ("CVaR 90%", self._fmt_pct(cvar90), "Average loss beyond VaR 90%"),
+            ("VaR 99%", self._fmt_pct(var99), "Observed periodic loss quantile"),
+            ("CVaR 99%", self._fmt_pct(cvar99), "Average loss beyond VaR 99%"),
+            ("Gross Exposure", self._fmt_pct(gross_exposure_pct), "Sum(|position values|) / NAV"),
+            ("Cash %", self._fmt_pct(cash_pct), "Cash / NAV"),
+            ("Open Positions", f"{latest_pos_count:,}", "Non-zero positions in latest NAV packet"),
+            ("Closed Trades", f"{len(self._trades):,}", "Completed round trips inferred from fills"),
+            ("Displayed Fills", f"{len(self._fills_display):,}", "Bounded UI fill history"),
+            ("Estimated periods/year", f"{ppy:,.0f}", "Inferred from median NAV timestamp spacing"),
+        ]
+        self._set_three_col_rows(self.metrics_table, rows)
+        self.metrics_summary_lbl.setText(
+            f"Risk-free rate: {self._fmt_pct(self._risk_free_rate_annual)} annual | "
+            f"Return: {self._fmt_pct(total_return)} | CAGR: {self._fmt_pct(cagr)} | "
+            f"Sharpe: {self._fmt_num(sharpe)} | Sortino: {self._fmt_num(sortino)} | "
+            f"Max DD: {self._fmt_pct(max_dd)}"
+        )
+        if hasattr(self, "drawdown_curve"):
+            self.drawdown_curve.setData(self._drawdown_x, self._drawdown_y)
+
+    def _first_scalar(self, scalars: dict, names):
+        for name in names:
+            if name in scalars:
+                v = self._finite_float(scalars.get(name))
+                if v is not None:
+                    return v
+        return None
+
+    def _update_online_learning_series(self, payload: dict, scalars: dict, latest_update: dict) -> None:
+        if not hasattr(self, "ol_regret_curve"):
+            return
+
+        tick = payload.get("tick", None)
+        x = self._finite_float(tick)
+        if x is None:
+            x = float(len(self._ol_x))
+
+        key = (str(payload.get("ts", "")), int(x) if math.isfinite(float(x)) else len(self._ol_x))
+        if key == self._last_learning_key:
+            return
+        self._last_learning_key = key
+
+        merged = {}
+        if isinstance(scalars, dict):
+            merged.update(scalars)
+        if isinstance(latest_update, dict):
+            for k, v in latest_update.items():
+                merged.setdefault(k, v)
+
+        regret = self._first_scalar(merged, (
+            "regret", "instant_regret", "step_regret", "round_regret",
+            "static_regret", "dynamic_regret", "portfolio_regret",
+        ))
+        cum_regret = self._first_scalar(merged, (
+            "cum_regret", "cumm_regret", "cumulative_regret", "total_regret",
+            "cumulative_static_regret", "cumulative_dynamic_regret",
+            "cum_static_regret", "cum_dynamic_regret",
+        ))
+
+        loss = self._first_scalar(merged, ("loss", "round_loss", "portfolio_loss", "learner_loss", "total_loss"))
+        oracle_loss = self._first_scalar(merged, ("oracle_loss", "benchmark_loss", "best_loss", "comparator_loss"))
+        if regret is None and loss is not None and oracle_loss is not None:
+            regret = float(loss) - float(oracle_loss)
+        if cum_regret is None and regret is not None:
+            prev = self._ol_cum_regret_y[-1] if self._ol_cum_regret_y else 0.0
+            cum_regret = prev + float(regret)
+
+        if regret is not None or cum_regret is not None:
+            self._ol_x.append(float(x))
+            self._ol_regret_y.append(float(regret) if regret is not None else 0.0)
+            self._ol_cum_regret_y.append(float(cum_regret) if cum_regret is not None else (self._ol_cum_regret_y[-1] if self._ol_cum_regret_y else 0.0))
+
+        reward = self._first_scalar(merged, ("reward", "last_reward", "step_reward", "episode_reward"))
+        if loss is None:
+            loss = self._first_scalar(merged, ("policy_loss", "value_loss"))
+        if reward is not None or loss is not None:
+            self._ol_aux_x.append(float(x))
+            self._ol_reward_y.append(float(reward) if reward is not None else (self._ol_reward_y[-1] if self._ol_reward_y else 0.0))
+            self._ol_loss_y.append(float(loss) if loss is not None else (self._ol_loss_y[-1] if self._ol_loss_y else 0.0))
+
+        now = time.perf_counter()
+        if (now - self._last_ol_plot_update) >= (1.0 / self._ol_plot_fps):
+            self._last_ol_plot_update = now
+            self.ol_regret_curve.setData(self._ol_x, self._ol_regret_y)
+            self.ol_cum_regret_curve.setData(self._ol_x, self._ol_cum_regret_y)
+            self.ol_reward_curve.setData(self._ol_aux_x, self._ol_reward_y)
+            self.ol_loss_curve.setData(self._ol_aux_x, self._ol_loss_y)
+
     def _fmt_metric_value(self, value) -> str:
         if isinstance(value, float):
             if abs(value) >= 1000:
@@ -523,10 +910,16 @@ class RealTimeDashboard(QMainWindow):
             header_parts.append(ts)
         self.lbl_learning.setText("Learning: " + " | ".join(header_parts[:3]))
 
+        self._update_online_learning_series(payload, scalars, latest_update)
+
+        regret_points = len(self._ol_x)
+        aux_points = len(self._ol_aux_x)
         self.learn_summary_lbl.setText(
             f"Strategy: {strategy}\n"
             f"Status: {status}\n"
-            f"Timestamp: {ts or '-'}"
+            f"Timestamp: {ts or '-'}\n"
+            f"Regret points: {regret_points} | Reward/loss points: {aux_points}\n"
+            "Note: regret is only meaningful if the strategy publishes an oracle/comparator loss or regret scalar."
         )
 
         scalar_rows = sorted(scalars.items(), key=lambda kv: str(kv[0]))

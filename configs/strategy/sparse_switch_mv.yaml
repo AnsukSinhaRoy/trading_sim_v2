@@ -1,0 +1,18 @@
+strategy:
+  type: sparse_switch_mv
+  rebalance_minutes: 375
+  lookback_bars: 260
+  estimation_frequency: "1d"
+  mean_lookback_periods: 60
+  cov_lookback_periods: 120
+  support_k: 30
+  lambda_risk: 0.0
+  kappa_switch: 0.0
+  step_size: 0.5
+  cov_shrinkage: 0.10
+  cov_epsilon: 1.0e-5
+  persistence_bonus: 0.02
+  min_history_periods: 40
+  max_weight_per_asset: 0.15
+  warm_start: true
+  verbose_debug: false

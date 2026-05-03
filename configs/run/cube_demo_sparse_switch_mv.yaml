@@ -1,0 +1,12 @@
+run:
+  name: sparse_switch_mv_nifty500
+  out_dir: runs
+  seed: 7
+  log_level: INFO
+  progress_every_ticks: 376
+
+modules:
+  market_feed: ../market_feed/cube_feed.yaml
+  execution:   ../execution/paper_fixed_bps.yaml
+  strategy:    ../strategy/sparse_switch_mv.yaml
+  ui:          ../ui/qt_dashboard.yaml

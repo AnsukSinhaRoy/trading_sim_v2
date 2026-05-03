@@ -1,0 +1,25 @@
+Validation performed inside the container
+======================================
+
+1) Smoke tests
+   Command:
+     PYTHONPATH=. pytest -q tests/smoke
+   Result:
+     9 passed, 6 skipped in 6.41s
+
+2) RL-specific tests
+   Command:
+     PYTHONPATH=. pytest -q tests/smoke/test_rl_agent_learning.py tests/smoke/test_rl_agent_checkpoint_resume.py
+   Result:
+     2 passed in 4.74s
+
+3) End-to-end synthetic engine run
+   Config:
+     /tmp/rl_synth_quick.yaml
+   Result:
+     runner completed successfully, checkpoint files written to /tmp/rl_quick_model
+
+4) Resume behavior check
+   Observed meta.json decision_steps increase across repeated runs:
+     before: 9
+     after: 17
