@@ -117,6 +117,16 @@ class IntradayRepairer:
 
             df.to_parquet(out_dir / 'close.parquet', index=False)
 
+            # Preserve non-price matrices such as volume.parquet/open.parquet/high.parquet/low.parquet
+            # inside each date partition. The earlier implementation only wrote repaired
+            # close.parquet. That made repaired stores unusable for liquidity-aware execution,
+            # because the feed could no longer see volume.
+            if self.copy_non_price_files:
+                for src_file in dd.glob('*.parquet'):
+                    if src_file.name == 'close.parquet':
+                        continue
+                    shutil.copy2(src_file, out_dir / src_file.name)
+
         if self.copy_non_price_files:
             for child in self.input_store.iterdir():
                 if child.name.startswith('date='):

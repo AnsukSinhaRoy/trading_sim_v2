@@ -16,18 +16,32 @@ from common.events import MarketSnapshot
 Format = Literal["csv", "parquet"]
 log = logging.getLogger("levitate")
 
-def _read_symbol_frame(path: Path, fmt: Format, timestamp_col: str, price_col: str) -> pd.DataFrame:
+def _read_symbol_frame(path: Path, fmt: Format, timestamp_col: str, price_col: str, volume_col: Optional[str] = None) -> pd.DataFrame:
+    usecols = [timestamp_col, price_col]
+    if volume_col:
+        usecols.append(volume_col)
     if fmt == "csv":
-        df = pd.read_csv(path, usecols=[timestamp_col, price_col], parse_dates=[timestamp_col])
+        try:
+            df = pd.read_csv(path, usecols=usecols, parse_dates=[timestamp_col])
+        except ValueError:
+            # Backward-compatible fallback for files without a volume column.
+            df = pd.read_csv(path, usecols=[timestamp_col, price_col], parse_dates=[timestamp_col])
     elif fmt == "parquet":
-        df = pd.read_parquet(path, columns=[timestamp_col, price_col])
+        try:
+            df = pd.read_parquet(path, columns=usecols)
+        except Exception:
+            df = pd.read_parquet(path, columns=[timestamp_col, price_col])
         df[timestamp_col] = pd.to_datetime(df[timestamp_col])
     else:
         raise ValueError(f"Unsupported format: {fmt}")
 
     df = df.dropna(subset=[timestamp_col, price_col]).sort_values(timestamp_col)
-    df = df.set_index(timestamp_col).rename(columns={price_col: "price"})
-    return df[["price"]]
+    rename = {price_col: "price"}
+    if volume_col and volume_col in df.columns:
+        rename[volume_col] = "volume"
+    df = df.set_index(timestamp_col).rename(columns=rename)
+    cols = ["price"] + (["volume"] if "volume" in df.columns else [])
+    return df[cols]
 
 def _build_calendar(start: datetime, end: datetime, freq: str) -> pd.DatetimeIndex:
     return pd.date_range(start=start, end=end, freq=freq)
@@ -73,6 +87,7 @@ class FolderMinuteFeed:
     file_pattern: str = "{symbol}_minute.{ext}"
     timestamp_col: str = "date"
     price_col: str = "close"
+    volume_col: Optional[str] = "volume"
     freq: str = "1min"
     fill: Literal["ffill", "none"] = "ffill"
     speed: Literal["fast", "realtime"] = "fast"
@@ -114,7 +129,7 @@ class FolderMinuteFeed:
             path = data_dir / self.file_pattern.format(symbol=sym, ext=ext)
             if not path.exists():
                 continue
-            df = _read_symbol_frame(path, self.fmt, self.timestamp_col, self.price_col)
+            df = _read_symbol_frame(path, self.fmt, self.timestamp_col, self.price_col, self.volume_col)
             df = df.loc[(df.index >= self.start) & (df.index <= self.end)]
             frames[sym] = df
             if self.progress_every and (i % self.progress_every == 0 or i == total):
@@ -125,22 +140,32 @@ class FolderMinuteFeed:
 
         cal = _build_calendar(self.start, self.end, self.freq)
         aligned: Dict[str, pd.Series] = {}
+        aligned_volumes: Dict[str, pd.Series] = {}
         for sym, df in frames.items():
             s = df["price"].reindex(cal)
             if self.fill == "ffill":
                 s = s.ffill()
             aligned[sym] = s
+            if "volume" in df.columns:
+                # Volumes are interval quantities; never forward-fill them.
+                aligned_volumes[sym] = df["volume"].reindex(cal)
 
         # Stream snapshots
         for ts in cal:
             prices = {}
+            volumes = {}
             for sym, s in aligned.items():
                 v = s.loc[ts]
                 if pd.isna(v):
                     continue
                 prices[sym] = float(v)
+                vs = aligned_volumes.get(sym)
+                if vs is not None:
+                    vv = vs.loc[ts]
+                    if not pd.isna(vv):
+                        volumes[sym] = float(vv)
 
-            yield MarketSnapshot(ts=ts.to_pydatetime(), prices=prices)
+            yield MarketSnapshot(ts=ts.to_pydatetime(), prices=prices, volumes=volumes)
 
             if self.speed == "realtime":
                 await asyncio.sleep(1.0)

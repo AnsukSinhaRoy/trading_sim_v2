@@ -6,8 +6,8 @@ strategy:
   mean_lookback_periods: 60
   cov_lookback_periods: 120
   support_k: 30
-  lambda_risk: 0.0
-  kappa_switch: 0.0
+  lambda_risk: 0 #10
+  kappa_switch: 0 #10
   step_size: 0.5
   cov_shrinkage: 0.10
   cov_epsilon: 1.0e-5

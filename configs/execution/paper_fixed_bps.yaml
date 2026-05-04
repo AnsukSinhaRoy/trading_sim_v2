@@ -6,3 +6,18 @@ execution:
   fees:
     model: fixed_bps
     bps: 1
+
+  # Liquidity-aware execution guardrails.
+  # These are data-driven caps, not fixed share-count caps:
+  # - each minute order can consume at most a fraction of that minute's volume
+  # - total position can be capped as a fraction of rolling average daily volume
+  # This prevents the simulator from buying an unrealistic share count in low-price
+  # / low-liquidity names without banning cheap stocks outright.
+  liquidity:
+    enabled: true
+    max_bar_participation: 0.10
+    max_position_adv_participation: 0.10
+    adv_lookback_days: 20
+    min_adv_history_days: 5
+    require_volume_for_buys: true
+    apply_to_sells: true

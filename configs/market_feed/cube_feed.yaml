@@ -2,7 +2,13 @@ market_feed:
   type: matrix_store_1m
 
   # IMPORTANT: point to the cube store root
-  store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired_v2"
+  store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired"
+
+  # Optional: when store_dir points to a repaired close-only store, read volume
+  # matrices from the original cube store so liquidity-aware execution can run.
+  # If this path does not exist, the feed also tries the sibling auto-fallback
+  # 1m_cube_store_repaired* -> 1m_cube_store.
+  volume_store_dir: "E:/data_1m/processed_data/nifty500/1m_cube_store_repaired"
 
   # Pick a window (start/end must fall on available dates)
   start: "2015-02-02 09:15:00"

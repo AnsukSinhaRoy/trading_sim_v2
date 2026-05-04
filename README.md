@@ -4,6 +4,13 @@ This repo is a **config-driven trading simulation/backtest scaffold** built arou
 
 > **Events are the source of truth.** Everything else (NAV series, fills tables, positions, dashboards) is derived from the event log.
 
+
+## Simulator realism and research features
+
+This project is more than a vectorized backtest. It includes an event-sourced simulation loop, append-only JSONL event logs, whole-share paper execution, slippage/fees, volume-aware liquidity constraints, rolling ADV position caps, live PyQt monitoring, online backtest metrics, online-learning telemetry, and NAV spike forensics.
+
+See [`docs/SIMULATOR_FEATURES.md`](docs/SIMULATOR_FEATURES.md) for the full feature inventory and technical positioning.
+
 ## High-level architecture
 
 ```

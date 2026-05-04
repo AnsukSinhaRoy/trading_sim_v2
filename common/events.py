@@ -7,6 +7,11 @@ class MarketSnapshot(BaseModel):
     kind: Literal["market_snapshot"] = "market_snapshot"
     ts: datetime
     prices: Dict[str, float]
+    # Optional traded share volume for the same snapshot interval.
+    # Existing feeds/configs that only provide prices remain valid because this
+    # defaults to an empty dict. Liquidity-aware execution uses this when
+    # available to enforce participation/ADV capacity constraints.
+    volumes: Dict[str, float] = Field(default_factory=dict)
 
 class OrderRequest(BaseModel):
     kind: Literal["order_request"] = "order_request"

@@ -1,9 +1,11 @@
 from __future__ import annotations
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Any, TYPE_CHECKING
+from typing import Dict, List, Any, TYPE_CHECKING, Optional
 from datetime import datetime, date
 from decimal import Decimal
+from collections import defaultdict, deque
+from dataclasses import dataclass
 import uuid, math, csv, json
 import importlib
 
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     from common.events import FillEvent, OrderAck, TradeOpen, TradeClose
 from execution.paper import PaperExecutionEngine
 from market_feed import SyntheticMinuteFeed, FolderMinuteFeed, MatrixStoreMinuteFeed
+from market_feed.sanitized_matrix_store_1m import SanitizedMatrixStoreMinuteFeed
 from analytics.build import build_derived_from_events
 
 # --- ZMQ Publisher Class ---
@@ -117,6 +120,7 @@ def _make_feed(cfg: Config):
             file_pattern=cfg.get("market_feed","file_pattern", default="{symbol}_minute.{ext}"),
             timestamp_col=cfg.get("market_feed","timestamp_col", default="date"),
             price_col=cfg.get("market_feed","price_col", default="close"),
+            volume_col=cfg.get("market_feed","volume_col", default="volume"),
             freq=cfg.get("market_feed","freq", default="1min"),
             fill=cfg.get("market_feed","fill", default="ffill"),
             speed=cfg.get("market_feed","speed", default="fast"),
@@ -145,6 +149,34 @@ def _make_feed(cfg: Config):
             end=end_dt,
             symbols=cfg.get("market_feed","symbols", default=None),
             speed=cfg.get("market_feed","speed", default="fast"),
+            volume_store_dir=cfg.get("market_feed", "volume_store_dir", default=None),
+        )
+
+    if ftype == "sanitized_matrix_store_1m":
+        start = parse_dt(cfg.get("market_feed","start"))
+        end = cfg.get("market_feed","end", default=None)
+        minutes = cfg.get("market_feed","minutes", default=None)
+        if end is None and minutes is None:
+            raise ValueError("sanitized_matrix_store_1m requires either market_feed.end or market_feed.minutes")
+        if end is None and minutes is not None:
+            from datetime import timedelta
+            end_dt = start + timedelta(minutes=int(minutes))
+        else:
+            end_dt = parse_dt(end)
+
+        return SanitizedMatrixStoreMinuteFeed(
+            store_dir=cfg.get("market_feed","store_dir"),
+            start=start,
+            end=end_dt,
+            symbols=cfg.get("market_feed","symbols", default=None),
+            speed=cfg.get("market_feed","speed", default="fast"),
+            volume_store_dir=cfg.get("market_feed", "volume_store_dir", default=None),
+            max_abs_return=float(cfg.get("market_feed","max_abs_return", default=0.35)),
+            min_price=float(cfg.get("market_feed","min_price", default=1e-9)),
+            stats_every_rows=int(cfg.get("market_feed","stats_every_rows", default=0)),
+            rebase_after_rejections=int(cfg.get("market_feed","rebase_after_rejections", default=3)),
+            rebase_continuity_max_abs_return=float(cfg.get("market_feed","rebase_continuity_max_abs_return", default=0.10)),
+            rebase_max_abs_return=float(cfg.get("market_feed","rebase_max_abs_return", default=0.95)),
         )
 
     raise ValueError(f"Unsupported market_feed.type: {ftype}")
@@ -354,38 +386,199 @@ def _extract_strategy_telemetry(strat, snap: MarketSnapshot, port: PositionSnaps
     return payload
 
 
-def _rebalance(ts, target_w: Dict[str, float], snap: MarketSnapshot, port: PositionSnapshot) -> List[OrderRequest]:
+
+
+
+@dataclass
+class LiquidityConstraints:
+    """Data-driven execution capacity controls.
+
+    These are not fixed share-count limits. They scale with the actual traded
+    volume of each symbol, so liquid large-cap names can absorb larger orders
+    while illiquid/penny names are naturally throttled.
+    """
+
+    enabled: bool = False
+    max_bar_participation: float = 0.10
+    max_position_adv_participation: float = 0.10
+    adv_lookback_days: int = 20
+    min_adv_history_days: int = 5
+    require_volume_for_buys: bool = True
+    apply_to_sells: bool = True
+
+
+class LiquidityTracker:
+    """Online rolling ADV estimator from per-minute volume snapshots."""
+
+    def __init__(self, lookback_days: int = 20):
+        self.lookback_days = max(1, int(lookback_days))
+        self.current_date = None
+        self.current_day_volume: Dict[str, float] = defaultdict(float)
+        self.daily_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=self.lookback_days))
+        self.last_bar_volume: Dict[str, float] = {}
+        self.seen_volume_snapshots: int = 0
+        self.seen_volume_symbols: set[str] = set()
+
+    def update(self, ts: datetime, volumes: Optional[Dict[str, float]]) -> None:
+        d = ts.date()
+        if self.current_date is None:
+            self.current_date = d
+        elif d != self.current_date:
+            self._finalize_current_day()
+            self.current_date = d
+            self.current_day_volume = defaultdict(float)
+
+        clean: Dict[str, float] = {}
+        for sym, v in (volumes or {}).items():
+            try:
+                vv = float(v)
+            except Exception:
+                continue
+            if math.isfinite(vv) and vv > 0:
+                clean[str(sym)] = vv
+                self.current_day_volume[str(sym)] += vv
+        if clean:
+            self.seen_volume_snapshots += 1
+            self.seen_volume_symbols.update(clean.keys())
+        self.last_bar_volume = clean
+
+    def _finalize_current_day(self) -> None:
+        for sym, vol in self.current_day_volume.items():
+            if math.isfinite(float(vol)) and float(vol) > 0:
+                self.daily_history[sym].append(float(vol))
+
+    def adv_shares(self, sym: str, min_history_days: int = 1) -> Optional[float]:
+        hist = self.daily_history.get(sym)
+        if not hist or len(hist) < int(min_history_days):
+            return None
+        return float(sum(hist) / len(hist))
+
+
+def _make_liquidity_constraints(cfg: Config) -> LiquidityConstraints:
+    return LiquidityConstraints(
+        enabled=bool(cfg.get("execution", "liquidity", "enabled", default=False)),
+        max_bar_participation=float(cfg.get("execution", "liquidity", "max_bar_participation", default=0.10)),
+        max_position_adv_participation=float(cfg.get("execution", "liquidity", "max_position_adv_participation", default=0.10)),
+        adv_lookback_days=int(cfg.get("execution", "liquidity", "adv_lookback_days", default=20)),
+        min_adv_history_days=int(cfg.get("execution", "liquidity", "min_adv_history_days", default=5)),
+        require_volume_for_buys=bool(cfg.get("execution", "liquidity", "require_volume_for_buys", default=True)),
+        apply_to_sells=bool(cfg.get("execution", "liquidity", "apply_to_sells", default=True)),
+    )
+
+
+def _clean_weight(w: float) -> float:
+    try:
+        v = float(w)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v) or v <= 0:
+        return 0.0
+    return v
+
+
+def _bar_qty_cap(sym: str, side: str, snap: MarketSnapshot, liq: LiquidityConstraints) -> Optional[int]:
+    if not liq.enabled:
+        return None
+    if side == "SELL" and not liq.apply_to_sells:
+        return None
+
+    vol = getattr(snap, "volumes", {}) or {}
+    try:
+        bar_vol = float(vol.get(sym, 0.0))
+    except Exception:
+        bar_vol = 0.0
+
+    if not math.isfinite(bar_vol) or bar_vol <= 0:
+        # Unknown volume means no realistic way to estimate participation.
+        # For buys, block by default; for sells, follow apply_to_sells.
+        if side == "BUY" and liq.require_volume_for_buys:
+            return 0
+        if side == "SELL" and liq.apply_to_sells:
+            return 0
+        return None
+
+    cap = int(math.floor(max(0.0, liq.max_bar_participation) * bar_vol))
+    return max(0, cap)
+
+
+def _position_qty_cap(sym: str, liq: LiquidityConstraints, tracker: Optional[LiquidityTracker]) -> Optional[int]:
+    if not liq.enabled or tracker is None:
+        return None
+    adv = tracker.adv_shares(sym, min_history_days=liq.min_adv_history_days)
+    if adv is None or not math.isfinite(adv) or adv <= 0:
+        return None
+    cap = int(math.floor(max(0.0, liq.max_position_adv_participation) * adv))
+    return max(0, cap)
+
+
+def _rebalance(
+    ts,
+    target_w: Dict[str, float],
+    snap: MarketSnapshot,
+    port: PositionSnapshot,
+    liquidity: Optional[LiquidityConstraints] = None,
+    liquidity_tracker: Optional[LiquidityTracker] = None,
+) -> List[OrderRequest]:
     prices = snap.prices
     nav = float(port.nav)
     cash = float(port.cash)
     cur_pos = dict(port.positions)
-    desired_notional = {sym: float(w) * nav for sym, w in target_w.items()}
+    liq = liquidity or LiquidityConstraints(enabled=False)
+
+    desired_notional = {sym: _clean_weight(w) * nav for sym, w in target_w.items()}
     orders: List[OrderRequest] = []
 
-    # Sell logic
+    # Sell logic. Liquidity caps can force a gradual sell-down when the current
+    # position exceeds the ADV-based capacity, even if the optimizer still wants
+    # a larger theoretical target.
     for sym, qty in cur_pos.items():
         px = float(prices.get(sym, 0.0))
-        if px <= 0: continue
-        cur_val = qty * px
+        if px <= 0:
+            continue
+        cur_qty = int(qty)
         tgt_val = desired_notional.get(sym, 0.0)
-        if cur_val > tgt_val + 1e-9:
-            desired_qty = int(math.floor(tgt_val / px))
-            sell_qty = int(qty - desired_qty)
-            if sell_qty > 0:
-                orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="SELL", qty=sell_qty))
+        desired_qty = int(math.floor(max(0.0, tgt_val) / px))
 
-    # Buy logic
+        pos_cap = _position_qty_cap(sym, liq, liquidity_tracker)
+        if pos_cap is not None:
+            desired_qty = min(desired_qty, pos_cap)
+
+        sell_qty = int(cur_qty - desired_qty)
+        if sell_qty <= 0:
+            continue
+
+        bar_cap = _bar_qty_cap(sym, "SELL", snap, liq)
+        if bar_cap is not None:
+            sell_qty = min(sell_qty, bar_cap)
+        if sell_qty > 0:
+            orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="SELL", qty=sell_qty))
+
+    # Buy logic. The optimizer may ask for a target weight, but the execution
+    # layer only moves toward that target at a realistic participation rate and
+    # refuses to accumulate more than a configurable fraction of rolling ADV.
     remaining = cash
-    for sym, w in sorted(target_w.items(), key=lambda kv: kv[1], reverse=True):
+    for sym, w in sorted(target_w.items(), key=lambda kv: _clean_weight(kv[1]), reverse=True):
         px = float(prices.get(sym, 0.0))
-        if px <= 0: continue
+        if px <= 0:
+            continue
         qty = int(cur_pos.get(sym, 0))
-        cur_val = qty * px
         tgt_val = desired_notional.get(sym, 0.0)
-        if cur_val + 1e-9 >= tgt_val: continue
-        buy_val = tgt_val - cur_val
-        buy_qty = int(math.floor(buy_val / px))
-        buy_qty = min(buy_qty, int(math.floor(remaining / px)))
+        desired_qty = int(math.floor(max(0.0, tgt_val) / px))
+
+        pos_cap = _position_qty_cap(sym, liq, liquidity_tracker)
+        if pos_cap is not None:
+            desired_qty = min(desired_qty, pos_cap)
+
+        buy_qty = int(desired_qty - qty)
+        if buy_qty <= 0:
+            continue
+
+        bar_cap = _bar_qty_cap(sym, "BUY", snap, liq)
+        if bar_cap is not None:
+            buy_qty = min(buy_qty, bar_cap)
+
+        affordable_qty = int(math.floor(remaining / px))
+        buy_qty = min(buy_qty, affordable_qty)
         if buy_qty > 0:
             orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="BUY", qty=buy_qty))
             remaining -= buy_qty * px
@@ -409,6 +602,17 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
     feed = _make_feed(cfg)
     exe = _make_execution(cfg)
     strat = _make_strategy(cfg, run_dir=run_dir)
+    liquidity_constraints = _make_liquidity_constraints(cfg)
+    liquidity_tracker = LiquidityTracker(liquidity_constraints.adv_lookback_days) if liquidity_constraints.enabled else None
+    if log and liquidity_constraints.enabled:
+        log.info(
+            "Liquidity controls enabled: max_bar_participation=%.3f, "
+            "max_position_adv_participation=%.3f, adv_lookback_days=%d, min_adv_history_days=%d",
+            liquidity_constraints.max_bar_participation,
+            liquidity_constraints.max_position_adv_participation,
+            liquidity_constraints.adv_lookback_days,
+            liquidity_constraints.min_adv_history_days,
+        )
     
     # Initialize ZMQ Publisher (for Qt Dashboard)
     zmq_host = str(cfg.get("ui", "zmq_host", default="127.0.0.1"))
@@ -468,6 +672,7 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
     producer_task = asyncio.create_task(_produce_market_data(feed, queue))
 
     tick_count = 0
+    warned_missing_volume = False
     try:
         while True:
             # Wait for next event
@@ -484,15 +689,46 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                 
                 # 1. Update Execution State (Mark-to-Market)
                 exe.update_market(event)
+                if liquidity_tracker is not None:
+                    liquidity_tracker.update(event.ts, getattr(event, "volumes", {}))
+                    if (
+                        log
+                        and liquidity_constraints.enabled
+                        and liquidity_constraints.require_volume_for_buys
+                        and not warned_missing_volume
+                        and tick_count >= 1000
+                        and liquidity_tracker.seen_volume_snapshots == 0
+                    ):
+                        warned_missing_volume = True
+                        log.warning(
+                            "Liquidity controls are enabled, but the market feed has emitted no volume data "
+                            "after %d ticks. New buys will be blocked while require_volume_for_buys=true. "
+                            "Use a cube store with volume.parquet, set market_feed.volume_store_dir to the "
+                            "original cube store, or rebuild/repair the cube store preserving volume.parquet.",
+                            tick_count,
+                        )
 
                 # 2. Strategy Logic
                 strat.on_snapshot(event, port)
                 
                 # 3. Generate Orders
+                #
+                # Historical behavior restored intentionally: once a strategy
+                # has published non-empty target weights, the engine keeps
+                # aligning the actual paper portfolio to that target on every
+                # market tick. This enables continuous target tracking until
+                # the strategy clears or replaces `_last_target_weights`.
                 orders: List[OrderRequest] = []
                 target_w = getattr(strat, "_last_target_weights", None)
                 if isinstance(target_w, dict) and target_w:
-                    orders = _rebalance(event.ts, target_w, event, port)
+                    orders = _rebalance(
+                        event.ts,
+                        target_w,
+                        event,
+                        port,
+                        liquidity=liquidity_constraints,
+                        liquidity_tracker=liquidity_tracker,
+                    )
                     
                     if orders:
                         logger.append_many(orders)

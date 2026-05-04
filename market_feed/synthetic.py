@@ -26,7 +26,11 @@ class SyntheticMinuteFeed:
                 prices[s] *= math.exp(drift + random.gauss(0.0, vol))
                 prices[s] = max(0.01, prices[s])
 
-            yield MarketSnapshot(ts=ts, prices=dict(prices))
+            # Synthetic volume is only a rough stand-in so liquidity-aware
+            # execution can be exercised in demos. Real backtests should use
+            # volume.parquet from the matrix store.
+            volumes = {s: float(max(1, int(random.lognormvariate(13.0, 0.5)))) for s in self.symbols}
+            yield MarketSnapshot(ts=ts, prices=dict(prices), volumes=volumes)
             ts = ts + timedelta(minutes=1)
 
             if self.speed == "realtime":
