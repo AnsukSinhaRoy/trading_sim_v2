@@ -137,6 +137,14 @@ class SparseSwitchMVStrategy:
     min_target_weight: float = 1e-6
     allow_same_period_rebalance: bool = False
 
+    # Optional telemetry-only diagnostic from the progress report.
+    # This does not change support selection, optimization, or execution.
+    track_regret: bool = False
+    publish_regret: bool = False
+    regret_mode: str = "estimation_gap"
+    regret_publish_on: str = "rebalance"
+    regret_publish_fields: Optional[Sequence[str]] = None
+
     _ticks: int = 0
     _last_target_weights: Dict[str, float] = field(default_factory=dict)
     _period_closes: Deque[Tuple[object, Dict[str, float]]] = field(default_factory=deque)
@@ -144,6 +152,17 @@ class SparseSwitchMVStrategy:
     _current_period_close: Dict[str, float] = field(default_factory=dict)
     _last_rebalance_period_key: object = None
     _last_diag: Dict[str, object] = field(default_factory=dict)
+
+    _pending_regret_decision: Optional[Dict[str, object]] = None
+    _last_estimation_regret: Optional[float] = None
+    _last_estimated_loss: Optional[float] = None
+    _last_observed_loss: Optional[float] = None
+    _cumulative_estimation_regret: float = 0.0
+    _positive_estimation_regret: float = 0.0
+    _sum_abs_estimation_gap: float = 0.0
+    _regret_count: int = 0
+    _last_regret_ts: Optional[str] = None
+    _last_published_regret_count: int = 0
 
     def on_snapshot(self, snap: MarketSnapshot, portfolio: PositionSnapshot) -> List[OrderRequest]:
         self._ticks += 1
@@ -162,6 +181,7 @@ class SparseSwitchMVStrategy:
             return []
 
         snapshots = self._snapshot_history_with_current()
+        self._maybe_update_estimation_regret(snapshots, snap.ts)
         if len(snapshots) < max(3, self.min_history_periods + 1):
             self._set_skip_diag(snap.ts, f"insufficient aggregated history: periods={len(snapshots)}")
             return []
@@ -236,6 +256,7 @@ class SparseSwitchMVStrategy:
                 "mu_min": float(np.min(mu_e)) if mu_e.size else 0.0,
                 "cov_condition": float(_condition_number(sigma_e)),
                 "objective_value": float(objective_value),
+                **self._regret_scalars_for_telemetry(snap.ts),
             },
             "weights": {
                 "target": dict(sorted(target.items(), key=lambda kv: kv[1], reverse=True)[:10]),
@@ -245,6 +266,16 @@ class SparseSwitchMVStrategy:
                 "previous_support": prev_support_syms,
             },
         }
+
+        self._store_pending_regret_decision(
+            period_key=current_period,
+            symbols=symbols_e,
+            mu=mu_e,
+            sigma=sigma_e,
+            weights=target_full,
+            prev_weights=prev_w_e,
+            estimated_loss=objective_value,
+        )
 
         if self.verbose_debug:
             print(
@@ -259,7 +290,9 @@ class SparseSwitchMVStrategy:
             return {
                 "mode": self._last_diag.get("mode", "sparse_switch_mv"),
                 "status": self._last_diag.get("status", "idle"),
-                "scalars": dict(self._last_diag.get("scalars", {})),
+                "scalars": self._filter_regret_scalars_for_snapshot(
+                    dict(self._last_diag.get("scalars", {})), snap
+                ),
                 "weights": dict(self._last_diag.get("weights", {"target": {}})),
                 "lists": dict(self._last_diag.get("lists", {})),
                 "latest_update": dict(self._last_diag.get("latest_update", {})),
@@ -288,6 +321,7 @@ class SparseSwitchMVStrategy:
                 "turnover": 0.0,
                 "lambda_risk": float(self.lambda_risk),
                 "kappa_switch": float(self.kappa_switch),
+                **self._regret_scalars_for_telemetry(ts),
             },
             "weights": {"target": dict(sorted(self._last_target_weights.items(), key=lambda kv: kv[1], reverse=True)[:10])},
             "lists": {},
@@ -295,6 +329,186 @@ class SparseSwitchMVStrategy:
         }
         if self.verbose_debug:
             print(f"[SparseSwitchMV] skip @ {ts}: {reason}")
+
+    def _regret_enabled(self) -> bool:
+        return bool(self.track_regret or self.publish_regret) and str(self.regret_mode).lower() in {
+            "estimation_gap",
+            "estimation_regret",
+            "realized_loss_gap",
+        }
+
+    def _store_pending_regret_decision(
+        self,
+        period_key: object,
+        symbols: Sequence[str],
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        weights: np.ndarray,
+        prev_weights: np.ndarray,
+        estimated_loss: float,
+    ) -> None:
+        if not self._regret_enabled():
+            return
+        self._pending_regret_decision = {
+            "period_key": period_key,
+            "symbols": list(symbols),
+            "mu": np.asarray(mu, dtype=float).copy(),
+            "sigma": np.asarray(sigma, dtype=float).copy(),
+            "weights": np.asarray(weights, dtype=float).copy(),
+            "prev_weights": np.asarray(prev_weights, dtype=float).copy(),
+            "estimated_loss": float(estimated_loss),
+        }
+
+    def _maybe_update_estimation_regret(
+        self,
+        snapshots: Sequence[Tuple[object, Dict[str, float]]],
+        ts: datetime,
+    ) -> None:
+        """
+        Compute the report's simple estimation-regret diagnostic for the most
+        recent completed decision once the next aggregated return is available.
+
+        rho_t = J_obs(w_t) - J_hat(w_t)
+
+        This is telemetry only. It deliberately does not feed back into support
+        selection, optimization, or order generation.
+        """
+        if not self._regret_enabled() or self._pending_regret_decision is None:
+            return
+        if len(snapshots) < 2:
+            return
+
+        pending = self._pending_regret_decision
+        decision_period = pending.get("period_key")
+        idx = None
+        for i, (pkey, _) in enumerate(snapshots[:-1]):
+            if pkey == decision_period:
+                idx = i
+                break
+        if idx is None or idx + 1 >= len(snapshots):
+            return
+
+        prev_close = snapshots[idx][1]
+        next_close = snapshots[idx + 1][1]
+        symbols = list(pending.get("symbols", []))
+        mu = np.asarray(pending.get("mu", []), dtype=float)
+        sigma = np.asarray(pending.get("sigma", []), dtype=float)
+        w = np.asarray(pending.get("weights", []), dtype=float)
+        prev_w = np.asarray(pending.get("prev_weights", []), dtype=float)
+
+        n = len(symbols)
+        if n == 0 or mu.shape != (n,) or w.shape != (n,) or prev_w.shape != (n,) or sigma.shape != (n, n):
+            self._pending_regret_decision = None
+            return
+
+        realized = np.array(mu, dtype=float, copy=True)
+        valid = 0
+        for j, sym in enumerate(symbols):
+            p0 = _safe_float(prev_close.get(sym, float("nan")), default=float("nan"))
+            p1 = _safe_float(next_close.get(sym, float("nan")), default=float("nan"))
+            if _is_finite_pos(p0) and _is_finite_pos(p1):
+                r = (p1 / p0) - 1.0
+                if math.isfinite(r):
+                    realized[j] = float(r)
+                    valid += 1
+
+        if valid == 0:
+            return
+
+        estimated_loss = _safe_float(pending.get("estimated_loss", 0.0))
+        diff = realized - mu
+        observed_loss = float(
+            -realized @ w
+            + 0.5 * float(self.lambda_risk) * float((w @ diff) ** 2)
+            + 0.5 * float(self.kappa_switch) * float(np.sum((w - prev_w) ** 2))
+        )
+        regret = float(observed_loss - estimated_loss)
+
+        self._last_estimation_regret = regret
+        self._last_estimated_loss = float(estimated_loss)
+        self._last_observed_loss = float(observed_loss)
+        self._cumulative_estimation_regret += regret
+        self._positive_estimation_regret += max(regret, 0.0)
+        self._sum_abs_estimation_gap += abs(regret)
+        self._regret_count += 1
+        self._last_regret_ts = ts.isoformat()
+        self._pending_regret_decision = None
+
+    def _regret_scalars_for_telemetry(self, ts: Optional[datetime] = None) -> Dict[str, float]:
+        if not self.publish_regret or self._last_estimation_regret is None:
+            return {}
+        avg_abs = self._sum_abs_estimation_gap / max(1, self._regret_count)
+        scalars = {
+            # Names intentionally include dashboard-friendly aliases.
+            "regret": float(self._last_estimation_regret),
+            "cum_regret": float(self._cumulative_estimation_regret),
+            "last_estimation_regret": float(self._last_estimation_regret),
+            "cumulative_estimation_regret": float(self._cumulative_estimation_regret),
+            "positive_estimation_regret": float(self._positive_estimation_regret),
+            "mean_abs_estimation_gap": float(avg_abs),
+            "regret_count": int(self._regret_count),
+        }
+        if self._last_estimated_loss is not None:
+            scalars["estimated_loss"] = float(self._last_estimated_loss)
+        if self._last_observed_loss is not None:
+            scalars["observed_loss"] = float(self._last_observed_loss)
+
+        fields = self.regret_publish_fields
+        if fields:
+            wanted = {str(x) for x in fields}
+            # Keep the two dashboard aliases even if the explicit field list uses
+            # the more descriptive report names.
+            if "last_estimation_regret" in wanted:
+                wanted.add("regret")
+            if "cumulative_estimation_regret" in wanted:
+                wanted.add("cum_regret")
+            scalars = {k: v for k, v in scalars.items() if k in wanted}
+        return scalars
+
+    def _filter_regret_scalars_for_snapshot(
+        self,
+        scalars: Dict[str, object],
+        snap: Optional[MarketSnapshot],
+    ) -> Dict[str, object]:
+        """
+        Decide when regret scalars are emitted to the dashboard.
+
+        The engine publishes the `learn` topic only every `ui.publish_every_ticks`.
+        That usually does not coincide with `rebalance_minutes` (for example,
+        376 vs 375 in the cube config). A strict same-tick rebalance gate therefore
+        computes regret but silently drops it before the UI ever sees it.
+
+        Default behavior: emit each newly computed regret value exactly once on
+        the next telemetry publish. Use regret_publish_on=always/every_publish if
+        you want the last regret value repeated on every learn payload.
+        """
+        if not self.publish_regret:
+            return scalars
+
+        mode = str(self.regret_publish_on).lower().strip()
+        if mode in {"always", "every", "every_publish", "snapshot", "all"}:
+            return scalars
+
+        regret_keys = {
+            "regret",
+            "cum_regret",
+            "last_estimation_regret",
+            "cumulative_estimation_regret",
+            "positive_estimation_regret",
+            "mean_abs_estimation_gap",
+            "regret_count",
+            "estimated_loss",
+            "observed_loss",
+        }
+
+        # For historical compatibility, `rebalance` now means: emit once at the
+        # next dashboard publish after the rebalance/regret computation.
+        # This is the only reliable behavior under throttled ZMQ publishing.
+        if self._last_estimation_regret is None or self._regret_count <= self._last_published_regret_count:
+            return {k: v for k, v in scalars.items() if k not in regret_keys}
+
+        self._last_published_regret_count = int(self._regret_count)
+        return scalars
 
     def _period_key(self, ts: datetime) -> object:
         if self.estimation_frequency == "1d":

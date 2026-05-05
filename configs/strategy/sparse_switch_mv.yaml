@@ -6,8 +6,8 @@ strategy:
   mean_lookback_periods: 60
   cov_lookback_periods: 120
   support_k: 30
-  lambda_risk: 0 #10
-  kappa_switch: 0 #10
+  lambda_risk: 50 #50
+  kappa_switch: 10 #10
   step_size: 0.5
   cov_shrinkage: 0.10
   cov_epsilon: 1.0e-5
@@ -16,3 +16,18 @@ strategy:
   max_weight_per_asset: 0.15
   warm_start: true
   verbose_debug: false
+  # Telemetry-only estimation-regret diagnostic from the progress report.
+  # This does not change support selection, optimization, or execution.
+  # It publishes dashboard-friendly scalars: regret and cum_regret.
+  track_regret: true
+  publish_regret: true
+  regret_mode: estimation_gap
+  regret_publish_on: rebalance
+  regret_publish_fields:
+    - last_estimation_regret
+    - cumulative_estimation_regret
+    - positive_estimation_regret
+    - mean_abs_estimation_gap
+    - regret_count
+    - estimated_loss
+    - observed_loss
