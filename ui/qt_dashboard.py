@@ -215,6 +215,9 @@ class RealTimeDashboard(QMainWindow):
         self._pnl_state: Dict[str, dict] = {}
         self._latest_marks: Dict[str, float] = {}
         self._latest_positions: Dict[str, int] = {}
+        self._latest_visible_symbols: List[str] = []
+        self._latest_prices: Dict[str, float] = {}
+        self._latest_target_weights: Dict[str, float] = {}
 
         # Throttles
         self._plot_fps = 2.0
@@ -316,10 +319,46 @@ class RealTimeDashboard(QMainWindow):
         metrics_layout.addWidget(metrics_splitter)
         self._metrics_tab_index = self.tabs.addTab(metrics, "Backtest Metrics")
 
+        # --- Return Distribution Tab ---
+        returns_tab = QWidget()
+        returns_layout = QVBoxLayout(returns_tab)
+        self.returns_summary_lbl = QLabel(
+            "Return distribution will appear after enough NAV snapshots. "
+            "VaR and CVaR are computed from sampled NAV-to-NAV returns."
+        )
+        self.returns_summary_lbl.setWordWrap(True)
+        self.returns_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
+        returns_layout.addWidget(self.returns_summary_lbl)
+
+        returns_splitter = QSplitter()
+        returns_splitter.setOrientation(Qt.Orientation.Vertical)
+
+        self.return_dist_plot = pg.PlotWidget()
+        self.return_dist_plot.setBackground("#1e1e1e")
+        self.return_dist_plot.setTitle("Sample Return Distribution", color="#dcdcdc")
+        self.return_dist_plot.setLabel("bottom", "Sample return (%)")
+        self.return_dist_plot.setLabel("left", "Frequency")
+        self.return_dist_plot.showGrid(x=True, y=True, alpha=0.3)
+        returns_splitter.addWidget(self.return_dist_plot)
+        self.return_dist_bars = None
+
+        self.return_risk_table = self.create_table(["Metric", "Value", "Notes"])
+        returns_splitter.addWidget(self.return_risk_table)
+
+        returns_layout.addWidget(returns_splitter)
+        self._returns_tab_index = self.tabs.addTab(returns_tab, "Return Distribution")
+
         # --- Positions Tab ---
         positions = QWidget()
         pos_layout = QVBoxLayout(positions)
-        self.pos_table = self.create_table(["Symbol", "Qty", "Value"])
+        self.positions_summary_lbl = QLabel(
+            "Positions table shows the current algorithm-visible universe. "
+            "Stocks with zero quantity are visible to the algorithm but not currently held."
+        )
+        self.positions_summary_lbl.setWordWrap(True)
+        self.positions_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
+        pos_layout.addWidget(self.positions_summary_lbl)
+        self.pos_table = self.create_table(["Symbol", "Visible", "Qty", "Price", "Value", "Target W"])
         pos_layout.addWidget(self.pos_table)
         self._positions_tab_index = self.tabs.addTab(positions, "Positions")
 
@@ -330,24 +369,50 @@ class RealTimeDashboard(QMainWindow):
         fills_layout.addWidget(self.fills_table)
         self._fills_tab_index = self.tabs.addTab(fills, "Fills")
 
-        # --- Online Learning Tab ---
-        learning = QWidget()
-        learning_layout = QVBoxLayout(learning)
+        # --- Online Parameters Tab ---
+        learning_params = QWidget()
+        learning_params_layout = QVBoxLayout(learning_params)
 
         self.learn_summary_lbl = QLabel(
-            "No learning telemetry received yet. Regret plots require the strategy "
-            "to publish regret/cum_regret or loss/oracle_loss in learn.scalars."
+            "No learning telemetry received yet. Parameters, support, target weights, "
+            "and scalar diagnostics will appear here."
         )
         self.learn_summary_lbl.setWordWrap(True)
         self.learn_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
-        learning_layout.addWidget(self.learn_summary_lbl)
+        learning_params_layout.addWidget(self.learn_summary_lbl)
 
-        learning_splitter = QSplitter()
-        learning_splitter.setOrientation(Qt.Orientation.Vertical)
+        params_splitter = QSplitter()
+        params_splitter.setOrientation(Qt.Orientation.Vertical)
+
+        self.learn_scalars_table = self.create_table(["Metric", "Value"])
+        params_splitter.addWidget(self.learn_scalars_table)
+
+        self.learn_weights_table = self.create_table(["Bucket", "Symbol", "Weight"])
+        params_splitter.addWidget(self.learn_weights_table)
+
+        self.learn_lists_table = self.create_table(["Name", "Value"])
+        params_splitter.addWidget(self.learn_lists_table)
+
+        learning_params_layout.addWidget(params_splitter)
+        self._learning_params_tab_index = self.tabs.addTab(learning_params, "Online Parameters")
+
+        # --- Online Regret Tab ---
+        learning_regret = QWidget()
+        learning_regret_layout = QVBoxLayout(learning_regret)
+
+        self.regret_summary_lbl = QLabel(
+            "No regret telemetry received yet. Regret plots require the strategy to publish "
+            "regret/cum_regret or loss/oracle_loss in learn.scalars."
+        )
+        self.regret_summary_lbl.setWordWrap(True)
+        self.regret_summary_lbl.setStyleSheet("font-size: 14px; padding: 8px; border: 1px solid #333;")
+        learning_regret_layout.addWidget(self.regret_summary_lbl)
 
         self.ol_regret_plot = pg.PlotWidget()
         self.ol_regret_plot.setBackground("#1e1e1e")
         self.ol_regret_plot.setTitle("Online Regret", color="#dcdcdc")
+        self.ol_regret_plot.setLabel("bottom", "Tick")
+        self.ol_regret_plot.setLabel("left", "Regret")
         self.ol_regret_plot.showGrid(x=True, y=True, alpha=0.3)
         self.ol_regret_curve = self.ol_regret_plot.plot(
             name="regret", pen=pg.mkPen(color="#ffd166", width=2)
@@ -356,32 +421,8 @@ class RealTimeDashboard(QMainWindow):
             name="cum_regret", pen=pg.mkPen(color="#06d6a0", width=2)
         )
         self.ol_regret_plot.addLegend()
-        learning_splitter.addWidget(self.ol_regret_plot)
-
-        self.ol_aux_plot = pg.PlotWidget()
-        self.ol_aux_plot.setBackground("#1e1e1e")
-        self.ol_aux_plot.setTitle("Learning Reward / Loss", color="#dcdcdc")
-        self.ol_aux_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.ol_reward_curve = self.ol_aux_plot.plot(
-            name="reward", pen=pg.mkPen(color="#00d4ff", width=2)
-        )
-        self.ol_loss_curve = self.ol_aux_plot.plot(
-            name="loss", pen=pg.mkPen(color="#ef476f", width=2)
-        )
-        self.ol_aux_plot.addLegend()
-        learning_splitter.addWidget(self.ol_aux_plot)
-
-        self.learn_scalars_table = self.create_table(["Metric", "Value"])
-        learning_splitter.addWidget(self.learn_scalars_table)
-
-        self.learn_weights_table = self.create_table(["Bucket", "Symbol", "Weight"])
-        learning_splitter.addWidget(self.learn_weights_table)
-
-        self.learn_lists_table = self.create_table(["Name", "Value"])
-        learning_splitter.addWidget(self.learn_lists_table)
-
-        learning_layout.addWidget(learning_splitter)
-        self._learning_tab_index = self.tabs.addTab(learning, "Online Learning")
+        learning_regret_layout.addWidget(self.ol_regret_plot)
+        self._learning_regret_tab_index = self.tabs.addTab(learning_regret, "Online Regret")
 
         # --- PnL Tab ---
         pnl = QWidget()
@@ -517,18 +558,34 @@ class RealTimeDashboard(QMainWindow):
                 self._last_metrics_update = now
                 self._render_backtest_metrics()
 
-            # Positions & marks from NAV packet
+            # Positions, visible universe, prices & marks from NAV packet.
             positions = self._latest_nav.get("positions", {}) if isinstance(self._latest_nav, dict) else {}
             pos_values = self._latest_nav.get("pos_values", {}) if isinstance(self._latest_nav, dict) else {}
+            visible_symbols = self._latest_nav.get("visible_symbols", []) if isinstance(self._latest_nav, dict) else []
+            prices = self._latest_nav.get("prices", {}) if isinstance(self._latest_nav, dict) else {}
+            target_weights = self._latest_nav.get("target_weights", {}) if isinstance(self._latest_nav, dict) else {}
+
             self._latest_positions = {str(k): int(v) for k, v in (positions or {}).items()}
+            self._latest_visible_symbols = [str(x) for x in (visible_symbols or [])]
+            self._latest_prices = {
+                str(k): float(v) for k, v in (prices or {}).items()
+                if self._finite_float(v) is not None
+            }
+            self._latest_target_weights = {
+                str(k): float(v) for k, v in (target_weights or {}).items()
+                if self._finite_float(v) is not None
+            }
 
             self._latest_marks = {}
             for sym, qty in self._latest_positions.items():
                 if qty:
-                    try:
-                        self._latest_marks[sym] = float((pos_values or {}).get(sym, 0.0)) / float(qty)
-                    except Exception:
-                        self._latest_marks[sym] = 0.0
+                    mark = self._latest_prices.get(sym)
+                    if mark is None:
+                        try:
+                            mark = float((pos_values or {}).get(sym, 0.0)) / float(qty)
+                        except Exception:
+                            mark = 0.0
+                    self._latest_marks[sym] = float(mark)
 
             self._render_positions(positions, pos_values)
 
@@ -710,6 +767,75 @@ class RealTimeDashboard(QMainWindow):
         # the observed lower tail was still profitable, so clamp at zero.
         return max(0.0, -float(q)), max(0.0, -float(cvar_ret))
 
+    def _render_return_distribution(self) -> None:
+        if not hasattr(self, "return_dist_plot"):
+            return
+        returns = [float(r) for r in self._nav_returns if math.isfinite(float(r))]
+        if len(returns) < 2:
+            if hasattr(self, "returns_summary_lbl"):
+                self.returns_summary_lbl.setText("Return distribution needs at least two NAV-to-NAV return samples.")
+            return
+
+        var90, cvar90 = self._tail_risk(returns, 0.90)
+        var95, cvar95 = self._tail_risk(returns, 0.95)
+        var99, cvar99 = self._tail_risk(returns, 0.99)
+        mean_ret = sum(returns) / float(len(returns))
+        std_ret = self._std(returns, sample=True)
+        best_ret = max(returns)
+        worst_ret = min(returns)
+
+        # Lightweight histogram without numpy dependency in the UI module.
+        mn, mx = min(returns), max(returns)
+        if mx <= mn:
+            mn -= 1e-12
+            mx += 1e-12
+        bin_count = min(60, max(10, int(math.sqrt(len(returns)))))
+        width = (mx - mn) / float(bin_count)
+        counts = [0] * bin_count
+        for r in returns:
+            idx = int((r - mn) / width)
+            if idx >= bin_count:
+                idx = bin_count - 1
+            if idx < 0:
+                idx = 0
+            counts[idx] += 1
+        centers_pct = [(mn + (i + 0.5) * width) * 100.0 for i in range(bin_count)]
+        bar_width_pct = width * 100.0 * 0.90
+
+        if self.return_dist_bars is not None:
+            try:
+                self.return_dist_plot.removeItem(self.return_dist_bars)
+            except Exception:
+                pass
+        self.return_dist_bars = pg.BarGraphItem(
+            x=centers_pct,
+            height=counts,
+            width=bar_width_pct,
+            brush=pg.mkBrush(80, 160, 220, 180),
+        )
+        self.return_dist_plot.addItem(self.return_dist_bars)
+
+        rows = [
+            ("Samples", f"{len(returns):,}", "NAV-to-NAV sampled returns"),
+            ("Mean Sample Return", self._fmt_pct(mean_ret), "Arithmetic mean"),
+            ("Sample Std Dev", self._fmt_pct(std_ret), "Non-annualized sample volatility"),
+            ("Best Sample Return", self._fmt_pct(best_ret), "Right tail"),
+            ("Worst Sample Return", self._fmt_pct(worst_ret), "Left tail"),
+            ("VaR 90%", self._fmt_pct(var90), "Loss threshold exceeded in worst 10% samples"),
+            ("CVaR 90%", self._fmt_pct(cvar90), "Average loss in worst 10% samples"),
+            ("VaR 95%", self._fmt_pct(var95), "Loss threshold exceeded in worst 5% samples"),
+            ("CVaR 95%", self._fmt_pct(cvar95), "Average loss in worst 5% samples"),
+            ("VaR 99%", self._fmt_pct(var99), "Loss threshold exceeded in worst 1% samples"),
+            ("CVaR 99%", self._fmt_pct(cvar99), "Average loss in worst 1% samples"),
+        ]
+        self._set_three_col_rows(self.return_risk_table, rows)
+        if hasattr(self, "returns_summary_lbl"):
+            self.returns_summary_lbl.setText(
+                f"Samples: {len(returns):,} | Mean: {self._fmt_pct(mean_ret)} | "
+                f"Std: {self._fmt_pct(std_ret)} | VaR95: {self._fmt_pct(var95)} | "
+                f"CVaR95: {self._fmt_pct(cvar95)}"
+            )
+
     def _render_backtest_metrics(self) -> None:
         if not hasattr(self, "metrics_table"):
             return
@@ -748,15 +874,19 @@ class RealTimeDashboard(QMainWindow):
         ann_mean_return = avg_ret * ppy
 
         var90, cvar90 = self._tail_risk(returns, 0.90)
+        var95, cvar95 = self._tail_risk(returns, 0.95)
         var99, cvar99 = self._tail_risk(returns, 0.99)
 
         gross_exposure = 0.0
         latest_pos_count = 0
+        visible_count = 0
         if isinstance(self._latest_nav, dict):
             pos_values = self._latest_nav.get("pos_values", {}) or {}
             positions = self._latest_nav.get("positions", {}) or {}
+            visible_symbols = self._latest_nav.get("visible_symbols", []) or []
             gross_exposure = sum(abs(float(v)) for v in pos_values.values() if self._finite_float(v) is not None)
             latest_pos_count = sum(1 for q in positions.values() if self._finite_float(q, 0.0))
+            visible_count = len(set(str(x) for x in visible_symbols))
         cash = 0.0
         if isinstance(self._latest_nav, dict):
             cash = self._finite_float(self._latest_nav.get("cash", 0.0), 0.0) or 0.0
@@ -782,11 +912,14 @@ class RealTimeDashboard(QMainWindow):
             ("Average Sample Return", self._fmt_pct(avg_ret), "Mean NAV-to-NAV sample"),
             ("VaR 90%", self._fmt_pct(var90), "Observed periodic loss quantile"),
             ("CVaR 90%", self._fmt_pct(cvar90), "Average loss beyond VaR 90%"),
+            ("VaR 95%", self._fmt_pct(var95), "Observed periodic loss quantile"),
+            ("CVaR 95%", self._fmt_pct(cvar95), "Average loss beyond VaR 95%"),
             ("VaR 99%", self._fmt_pct(var99), "Observed periodic loss quantile"),
             ("CVaR 99%", self._fmt_pct(cvar99), "Average loss beyond VaR 99%"),
             ("Gross Exposure", self._fmt_pct(gross_exposure_pct), "Sum(|position values|) / NAV"),
             ("Cash %", self._fmt_pct(cash_pct), "Cash / NAV"),
             ("Open Positions", f"{latest_pos_count:,}", "Non-zero positions in latest NAV packet"),
+            ("Algorithm-visible symbols", f"{visible_count:,}", "Symbols present in latest market snapshot"),
             ("Closed Trades", f"{len(self._trades):,}", "Completed round trips inferred from fills"),
             ("Displayed Fills", f"{len(self._fills_display):,}", "Bounded UI fill history"),
             ("Estimated periods/year", f"{ppy:,.0f}", "Inferred from median NAV timestamp spacing"),
@@ -800,6 +933,7 @@ class RealTimeDashboard(QMainWindow):
         )
         if hasattr(self, "drawdown_curve"):
             self.drawdown_curve.setData(self._drawdown_x, self._drawdown_y)
+        self._render_return_distribution()
 
     def _first_scalar(self, scalars: dict, names):
         for name in names:
@@ -857,6 +991,8 @@ class RealTimeDashboard(QMainWindow):
         if loss is None:
             loss = self._first_scalar(merged, ("policy_loss", "value_loss"))
         if reward is not None or loss is not None:
+            # Keep the auxiliary history for telemetry counts/debugging, but do not plot
+            # reward/loss anymore. The UI now has a dedicated regret tab.
             self._ol_aux_x.append(float(x))
             self._ol_reward_y.append(float(reward) if reward is not None else (self._ol_reward_y[-1] if self._ol_reward_y else 0.0))
             self._ol_loss_y.append(float(loss) if loss is not None else (self._ol_loss_y[-1] if self._ol_loss_y else 0.0))
@@ -866,8 +1002,6 @@ class RealTimeDashboard(QMainWindow):
             self._last_ol_plot_update = now
             self.ol_regret_curve.setData(self._ol_x, self._ol_regret_y)
             self.ol_cum_regret_curve.setData(self._ol_x, self._ol_cum_regret_y)
-            self.ol_reward_curve.setData(self._ol_aux_x, self._ol_reward_y)
-            self.ol_loss_curve.setData(self._ol_aux_x, self._ol_loss_y)
 
     def _fmt_metric_value(self, value) -> str:
         if isinstance(value, float):
@@ -913,14 +1047,20 @@ class RealTimeDashboard(QMainWindow):
         self._update_online_learning_series(payload, scalars, latest_update)
 
         regret_points = len(self._ol_x)
-        aux_points = len(self._ol_aux_x)
         self.learn_summary_lbl.setText(
             f"Strategy: {strategy}\n"
             f"Status: {status}\n"
             f"Timestamp: {ts or '-'}\n"
-            f"Regret points: {regret_points} | Reward/loss points: {aux_points}\n"
-            "Note: regret is only meaningful if the strategy publishes an oracle/comparator loss or regret scalar."
+            f"Scalar diagnostics: {len(scalars)} | Weight buckets: {len(weights)} | Lists: {len(lists)}"
         )
+        if hasattr(self, "regret_summary_lbl"):
+            self.regret_summary_lbl.setText(
+                f"Strategy: {strategy}\n"
+                f"Status: {status}\n"
+                f"Timestamp: {ts or '-'}\n"
+                f"Regret points: {regret_points} | Cumulative regret points: {len(self._ol_cum_regret_y)}\n"
+                "Note: regret is only meaningful if the strategy publishes an oracle/comparator loss or regret scalar."
+            )
 
         scalar_rows = sorted(scalars.items(), key=lambda kv: str(kv[0]))
         if latest_update:
@@ -946,22 +1086,87 @@ class RealTimeDashboard(QMainWindow):
         self._set_two_col_rows(self.learn_lists_table, list_rows)
 
     def _render_positions(self, positions: dict, pos_values: dict):
-        self.pos_table.setRowCount(0)
-        rows = []
-        for sym, qty in (positions or {}).items():
-            try:
-                v = float((pos_values or {}).get(sym, 0.0))
-            except Exception:
-                v = 0.0
-            rows.append((sym, int(qty), v))
-        rows.sort(key=lambda x: x[2], reverse=True)
+        """Render the algorithm-visible universe, not just non-zero holdings.
 
-        for sym, qty, v in rows:
-            r = self.pos_table.rowCount()
-            self.pos_table.insertRow(r)
-            self.pos_table.setItem(r, 0, QTableWidgetItem(str(sym)))
-            self.pos_table.setItem(r, 1, QTableWidgetItem(str(qty)))
-            self.pos_table.setItem(r, 2, QTableWidgetItem(f"{v:,.2f}"))
+        The engine publishes visible_symbols from the latest MarketSnapshot. That is
+        the set of stocks the strategy can currently see. Positions/values/targets
+        are overlaid on top of that universe.
+        """
+        self.pos_table.setRowCount(0)
+
+        visible = set(str(x) for x in (self._latest_visible_symbols or []))
+        held = set(str(x) for x in (positions or {}).keys())
+        targeted = set(str(x) for x in (self._latest_target_weights or {}).keys())
+        all_symbols = visible | held | targeted
+
+        rows = []
+        active_count = 0
+        targeted_count = 0
+        for sym in all_symbols:
+            qty = 0
+            try:
+                qty = int((positions or {}).get(sym, 0))
+            except Exception:
+                qty = 0
+            if qty != 0:
+                active_count += 1
+
+            price = self._latest_prices.get(sym)
+            if price is None and qty:
+                try:
+                    price = float((pos_values or {}).get(sym, 0.0)) / float(qty)
+                except Exception:
+                    price = 0.0
+            if price is None:
+                price = 0.0
+
+            try:
+                value = float((pos_values or {}).get(sym, 0.0))
+            except Exception:
+                value = float(qty) * float(price)
+
+            target_w = float(self._latest_target_weights.get(sym, 0.0))
+            if abs(target_w) > 1e-12:
+                targeted_count += 1
+
+            is_visible = sym in visible
+            # Sort held symbols first, then target symbols, then visible-only names.
+            rows.append((
+                0 if qty != 0 else (1 if abs(target_w) > 1e-12 else 2),
+                -abs(value),
+                sym,
+                is_visible,
+                qty,
+                float(price),
+                float(value),
+                target_w,
+            ))
+
+        rows.sort(key=lambda x: (x[0], x[1], x[2]))
+
+        if hasattr(self, "positions_summary_lbl"):
+            self.positions_summary_lbl.setText(
+                f"Algorithm-visible symbols: {len(visible):,} | "
+                f"Current non-zero holdings: {active_count:,} | "
+                f"Non-zero target weights: {targeted_count:,}. "
+                "Rows with Qty=0 are visible/targeted names that are not currently held."
+            )
+
+        self.pos_table.setUpdatesEnabled(False)
+        self.pos_table.blockSignals(True)
+        try:
+            for _, _, sym, is_visible, qty, price, value, target_w in rows:
+                r = self.pos_table.rowCount()
+                self.pos_table.insertRow(r)
+                self.pos_table.setItem(r, 0, QTableWidgetItem(str(sym)))
+                self.pos_table.setItem(r, 1, QTableWidgetItem("yes" if is_visible else "no"))
+                self.pos_table.setItem(r, 2, QTableWidgetItem(str(qty)))
+                self.pos_table.setItem(r, 3, QTableWidgetItem(f"{price:,.4f}" if price else "-"))
+                self.pos_table.setItem(r, 4, QTableWidgetItem(f"{value:,.2f}"))
+                self.pos_table.setItem(r, 5, QTableWidgetItem(self._fmt_pct(target_w) if abs(target_w) > 1e-12 else "-"))
+        finally:
+            self.pos_table.blockSignals(False)
+            self.pos_table.setUpdatesEnabled(True)
 
     def _render_recent_fills(self) -> None:
         if not hasattr(self, "ov_fills_table"):

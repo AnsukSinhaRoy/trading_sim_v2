@@ -642,6 +642,9 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
         "cash": float(port.cash),
         "positions": _positions0,
         "pos_values": _pos_values0,
+        "visible_symbols": [],
+        "prices": {},
+        "target_weights": {},
     })
     await pub.publish("learn", {
         "ts": port.ts.isoformat(),
@@ -779,12 +782,27 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                         px = float(exe.last_prices.get(sym, 0.0))
                         pos_values[sym] = float(qty) * px
 
+                    visible_symbols = sorted(str(sym) for sym in (event.prices or {}).keys())
+                    prices_for_ui = {
+                        str(sym): float(px)
+                        for sym, px in (event.prices or {}).items()
+                        if math.isfinite(_safe_float_for_ui(px, 0.0)) and _safe_float_for_ui(px, 0.0) > 0.0
+                    }
+                    target_weights_for_ui = {
+                        str(sym): _safe_float_for_ui(w)
+                        for sym, w in (target_w or {}).items()
+                        if abs(_safe_float_for_ui(w)) > 1e-12
+                    } if isinstance(target_w, dict) else {}
+
                     await pub.publish("nav", {
                         "ts": event.ts.isoformat(),
                         "nav": float(port.nav),
                         "cash": float(port.cash),
                         "positions": positions,
-                        "pos_values": pos_values
+                        "pos_values": pos_values,
+                        "visible_symbols": visible_symbols,
+                        "prices": prices_for_ui,
+                        "target_weights": target_weights_for_ui,
                     })
                     await pub.publish("learn", _extract_strategy_telemetry(strat, event, port, tick_count))
                 if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):

@@ -6,8 +6,8 @@ strategy:
   mean_lookback_periods: 60
   cov_lookback_periods: 120
   support_k: 30
-  lambda_risk: 50 #50
-  kappa_switch: 10 #10
+  lambda_risk: 0 #50
+  kappa_switch: 0 #10
   step_size: 0.5
   cov_shrinkage: 0.10
   cov_epsilon: 1.0e-5
@@ -16,28 +16,3 @@ strategy:
   max_weight_per_asset: 0.15
   warm_start: true
   verbose_debug: false
-
-  # Telemetry-only one-step hindsight return regret.
-  # At decision time the strategy chooses w_est using past/estimated data.
-  # After the next daily return is known, the strategy reruns the same optimizer
-  # using that realized daily return as the seen return signal, producing w_seen.
-  # Published regret is max(0, r^T w_seen - r^T w_est), so cum_regret is non-decreasing.
-  # This does not change the traded portfolio or support-selection logic.
-  track_regret: true
-  publish_regret: true
-  regret_mode: hindsight_return_gap
-
-  # `next_publish` matters because ui.publish_every_ticks may not align with
-  # rebalance_minutes. This emits each new regret value once on the next learn
-  # payload that the dashboard actually receives.
-  regret_publish_on: next_publish
-  regret_publish_fields:
-    - return_regret
-    - cumulative_return_regret
-    - raw_return_gap
-    - actual_portfolio_return
-    - hindsight_portfolio_return
-    - mean_abs_return_gap
-    - regret_count
-    - estimated_objective
-    - hindsight_objective
