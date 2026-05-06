@@ -16,18 +16,28 @@ strategy:
   max_weight_per_asset: 0.15
   warm_start: true
   verbose_debug: false
-  # Telemetry-only estimation-regret diagnostic from the progress report.
-  # This does not change support selection, optimization, or execution.
-  # It publishes dashboard-friendly scalars: regret and cum_regret.
+
+  # Telemetry-only one-step hindsight return regret.
+  # At decision time the strategy chooses w_est using past/estimated data.
+  # After the next daily return is known, the strategy reruns the same optimizer
+  # using that realized daily return as the seen return signal, producing w_seen.
+  # Published regret is max(0, r^T w_seen - r^T w_est), so cum_regret is non-decreasing.
+  # This does not change the traded portfolio or support-selection logic.
   track_regret: true
   publish_regret: true
-  regret_mode: estimation_gap
-  regret_publish_on: rebalance
+  regret_mode: hindsight_return_gap
+
+  # `next_publish` matters because ui.publish_every_ticks may not align with
+  # rebalance_minutes. This emits each new regret value once on the next learn
+  # payload that the dashboard actually receives.
+  regret_publish_on: next_publish
   regret_publish_fields:
-    - last_estimation_regret
-    - cumulative_estimation_regret
-    - positive_estimation_regret
-    - mean_abs_estimation_gap
+    - return_regret
+    - cumulative_return_regret
+    - raw_return_gap
+    - actual_portfolio_return
+    - hindsight_portfolio_return
+    - mean_abs_return_gap
     - regret_count
-    - estimated_loss
-    - observed_loss
+    - estimated_objective
+    - hindsight_objective

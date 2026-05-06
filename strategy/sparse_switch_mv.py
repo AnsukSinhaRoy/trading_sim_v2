@@ -137,11 +137,15 @@ class SparseSwitchMVStrategy:
     min_target_weight: float = 1e-6
     allow_same_period_rebalance: bool = False
 
-    # Optional telemetry-only diagnostic from the progress report.
+    # Optional telemetry-only regret diagnostic.
     # This does not change support selection, optimization, or execution.
+    # Default mode is a one-step hindsight return gap:
+    #   regret_t = max(0, r_t^T w_seen_t - r_t^T w_est_t)
+    # where w_est_t is the portfolio produced before the next return is known,
+    # and w_seen_t is produced by rerunning the same optimizer after that return is known.
     track_regret: bool = False
     publish_regret: bool = False
-    regret_mode: str = "estimation_gap"
+    regret_mode: str = "hindsight_return_gap"
     regret_publish_on: str = "rebalance"
     regret_publish_fields: Optional[Sequence[str]] = None
 
@@ -154,14 +158,17 @@ class SparseSwitchMVStrategy:
     _last_diag: Dict[str, object] = field(default_factory=dict)
 
     _pending_regret_decision: Optional[Dict[str, object]] = None
-    _last_estimation_regret: Optional[float] = None
-    _last_estimated_loss: Optional[float] = None
-    _last_observed_loss: Optional[float] = None
-    _cumulative_estimation_regret: float = 0.0
-    _positive_estimation_regret: float = 0.0
-    _sum_abs_estimation_gap: float = 0.0
+    _last_return_regret: Optional[float] = None
+    _last_raw_return_gap: Optional[float] = None
+    _last_actual_portfolio_return: Optional[float] = None
+    _last_hindsight_portfolio_return: Optional[float] = None
+    _last_hindsight_objective: Optional[float] = None
+    _last_actual_objective: Optional[float] = None
+    _cumulative_return_regret: float = 0.0
+    _sum_abs_return_gap: float = 0.0
     _regret_count: int = 0
     _last_regret_ts: Optional[str] = None
+    _last_hindsight_support: List[str] = field(default_factory=list)
     _last_published_regret_count: int = 0
 
     def on_snapshot(self, snap: MarketSnapshot, portfolio: PositionSnapshot) -> List[OrderRequest]:
@@ -181,7 +188,7 @@ class SparseSwitchMVStrategy:
             return []
 
         snapshots = self._snapshot_history_with_current()
-        self._maybe_update_estimation_regret(snapshots, snap.ts)
+        self._maybe_update_hindsight_return_regret(snapshots, snap.ts)
         if len(snapshots) < max(3, self.min_history_periods + 1):
             self._set_skip_diag(snap.ts, f"insufficient aggregated history: periods={len(snapshots)}")
             return []
@@ -274,7 +281,7 @@ class SparseSwitchMVStrategy:
             sigma=sigma_e,
             weights=target_full,
             prev_weights=prev_w_e,
-            estimated_loss=objective_value,
+            estimated_objective=objective_value,
         )
 
         if self.verbose_debug:
@@ -332,6 +339,12 @@ class SparseSwitchMVStrategy:
 
     def _regret_enabled(self) -> bool:
         return bool(self.track_regret or self.publish_regret) and str(self.regret_mode).lower() in {
+            "hindsight_return_gap",
+            "one_step_hindsight",
+            "return_gap",
+            # Backward-compatible aliases from the earlier patch. They now use
+            # the corrected hindsight-return formulation rather than the signed
+            # realized-minus-estimated loss gap.
             "estimation_gap",
             "estimation_regret",
             "realized_loss_gap",
@@ -345,33 +358,41 @@ class SparseSwitchMVStrategy:
         sigma: np.ndarray,
         weights: np.ndarray,
         prev_weights: np.ndarray,
-        estimated_loss: float,
+        estimated_objective: float,
     ) -> None:
         if not self._regret_enabled():
             return
         self._pending_regret_decision = {
             "period_key": period_key,
             "symbols": list(symbols),
-            "mu": np.asarray(mu, dtype=float).copy(),
+            "mu_est": np.asarray(mu, dtype=float).copy(),
             "sigma": np.asarray(sigma, dtype=float).copy(),
-            "weights": np.asarray(weights, dtype=float).copy(),
+            "estimated_weights": np.asarray(weights, dtype=float).copy(),
             "prev_weights": np.asarray(prev_weights, dtype=float).copy(),
-            "estimated_loss": float(estimated_loss),
+            "estimated_objective": float(estimated_objective),
         }
 
-    def _maybe_update_estimation_regret(
+    def _maybe_update_hindsight_return_regret(
         self,
         snapshots: Sequence[Tuple[object, Dict[str, float]]],
         ts: datetime,
     ) -> None:
         """
-        Compute the report's simple estimation-regret diagnostic for the most
-        recent completed decision once the next aggregated return is available.
+        Compute a one-step hindsight return regret after the next aggregated
+        return becomes available.
 
-        rho_t = J_obs(w_t) - J_hat(w_t)
+        At decision time, the live strategy has already chosen w_est using only
+        past/estimated data. Once the next daily return r is known, this method
+        reruns the same support-selection + restricted optimizer with r used as
+        the now-seen mean vector. It then compares realized portfolio returns:
 
-        This is telemetry only. It deliberately does not feed back into support
-        selection, optimization, or order generation.
+            raw_gap_t = r^T w_seen - r^T w_est
+            regret_t  = max(raw_gap_t, 0)
+
+        The max keeps cumulative regret non-decreasing. The signed raw gap is
+        also published separately as raw_return_gap. This is telemetry only; it
+        deliberately does not feed back into support selection, optimization,
+        target weights, or order generation.
         """
         if not self._regret_enabled() or self._pending_regret_decision is None:
             return
@@ -391,18 +412,18 @@ class SparseSwitchMVStrategy:
         prev_close = snapshots[idx][1]
         next_close = snapshots[idx + 1][1]
         symbols = list(pending.get("symbols", []))
-        mu = np.asarray(pending.get("mu", []), dtype=float)
+        mu_est = np.asarray(pending.get("mu_est", []), dtype=float)
         sigma = np.asarray(pending.get("sigma", []), dtype=float)
-        w = np.asarray(pending.get("weights", []), dtype=float)
+        w_est = np.asarray(pending.get("estimated_weights", []), dtype=float)
         prev_w = np.asarray(pending.get("prev_weights", []), dtype=float)
 
         n = len(symbols)
-        if n == 0 or mu.shape != (n,) or w.shape != (n,) or prev_w.shape != (n,) or sigma.shape != (n, n):
+        if n == 0 or mu_est.shape != (n,) or w_est.shape != (n,) or prev_w.shape != (n,) or sigma.shape != (n, n):
             self._pending_regret_decision = None
             return
 
-        realized = np.array(mu, dtype=float, copy=True)
-        valid = 0
+        realized = np.array(mu_est, dtype=float, copy=True)
+        valid_mask = np.zeros(n, dtype=bool)
         for j, sym in enumerate(symbols):
             p0 = _safe_float(prev_close.get(sym, float("nan")), default=float("nan"))
             p1 = _safe_float(next_close.get(sym, float("nan")), default=float("nan"))
@@ -410,57 +431,76 @@ class SparseSwitchMVStrategy:
                 r = (p1 / p0) - 1.0
                 if math.isfinite(r):
                     realized[j] = float(r)
-                    valid += 1
+                    valid_mask[j] = True
 
-        if valid == 0:
+        if not bool(np.any(valid_mask)):
             return
 
-        estimated_loss = _safe_float(pending.get("estimated_loss", 0.0))
-        diff = realized - mu
-        observed_loss = float(
-            -realized @ w
-            + 0.5 * float(self.lambda_risk) * float((w @ diff) ** 2)
-            + 0.5 * float(self.kappa_switch) * float(np.sum((w - prev_w) ** 2))
-        )
-        regret = float(observed_loss - estimated_loss)
+        # Do not reward/punish missing prices. Keep their realized signal at the
+        # estimate and compare both portfolios only on assets with known returns.
+        realized_for_return = np.zeros(n, dtype=float)
+        realized_for_return[valid_mask] = realized[valid_mask]
 
-        self._last_estimation_regret = regret
-        self._last_estimated_loss = float(estimated_loss)
-        self._last_observed_loss = float(observed_loss)
-        self._cumulative_estimation_regret += regret
-        self._positive_estimation_regret += max(regret, 0.0)
-        self._sum_abs_estimation_gap += abs(regret)
+        hindsight_support = self._select_support(symbols, realized, sigma, prev_w)
+        if not hindsight_support:
+            return
+
+        w_seen, hindsight_objective, _ = self._solve_full_target(
+            symbols, realized, sigma, prev_w, hindsight_support
+        )
+
+        actual_return = float(realized_for_return @ w_est)
+        hindsight_return = float(realized_for_return @ w_seen)
+        raw_gap = float(hindsight_return - actual_return)
+        regret = float(max(raw_gap, 0.0))
+
+        self._last_return_regret = regret
+        self._last_raw_return_gap = raw_gap
+        self._last_actual_portfolio_return = actual_return
+        self._last_hindsight_portfolio_return = hindsight_return
+        self._last_hindsight_objective = float(hindsight_objective)
+        self._last_actual_objective = float(_safe_float(pending.get("estimated_objective", 0.0)))
+        self._cumulative_return_regret += regret
+        self._sum_abs_return_gap += abs(raw_gap)
         self._regret_count += 1
         self._last_regret_ts = ts.isoformat()
+        self._last_hindsight_support = [symbols[int(i)] for i in hindsight_support]
         self._pending_regret_decision = None
 
     def _regret_scalars_for_telemetry(self, ts: Optional[datetime] = None) -> Dict[str, float]:
-        if not self.publish_regret or self._last_estimation_regret is None:
+        if not self.publish_regret or self._last_return_regret is None:
             return {}
-        avg_abs = self._sum_abs_estimation_gap / max(1, self._regret_count)
+        mean_abs_gap = self._sum_abs_return_gap / max(1, self._regret_count)
         scalars = {
-            # Names intentionally include dashboard-friendly aliases.
-            "regret": float(self._last_estimation_regret),
-            "cum_regret": float(self._cumulative_estimation_regret),
-            "last_estimation_regret": float(self._last_estimation_regret),
-            "cumulative_estimation_regret": float(self._cumulative_estimation_regret),
-            "positive_estimation_regret": float(self._positive_estimation_regret),
-            "mean_abs_estimation_gap": float(avg_abs),
+            # Dashboard aliases. These now represent one-step hindsight return
+            # regret, not the older signed estimation-loss gap.
+            "regret": float(self._last_return_regret),
+            "cum_regret": float(self._cumulative_return_regret),
+            "return_regret": float(self._last_return_regret),
+            "cumulative_return_regret": float(self._cumulative_return_regret),
+            "raw_return_gap": float(self._last_raw_return_gap if self._last_raw_return_gap is not None else 0.0),
+            "actual_portfolio_return": float(
+                self._last_actual_portfolio_return if self._last_actual_portfolio_return is not None else 0.0
+            ),
+            "hindsight_portfolio_return": float(
+                self._last_hindsight_portfolio_return if self._last_hindsight_portfolio_return is not None else 0.0
+            ),
+            "mean_abs_return_gap": float(mean_abs_gap),
             "regret_count": int(self._regret_count),
         }
-        if self._last_estimated_loss is not None:
-            scalars["estimated_loss"] = float(self._last_estimated_loss)
-        if self._last_observed_loss is not None:
-            scalars["observed_loss"] = float(self._last_observed_loss)
+        if self._last_actual_objective is not None:
+            scalars["estimated_objective"] = float(self._last_actual_objective)
+        if self._last_hindsight_objective is not None:
+            scalars["hindsight_objective"] = float(self._last_hindsight_objective)
 
         fields = self.regret_publish_fields
         if fields:
             wanted = {str(x) for x in fields}
-            # Keep the two dashboard aliases even if the explicit field list uses
-            # the more descriptive report names.
-            if "last_estimation_regret" in wanted:
+            # Keep the dashboard aliases if the explicit field list uses the
+            # descriptive names.
+            if "return_regret" in wanted:
                 wanted.add("regret")
-            if "cumulative_estimation_regret" in wanted:
+            if "cumulative_return_regret" in wanted:
                 wanted.add("cum_regret")
             scalars = {k: v for k, v in scalars.items() if k in wanted}
         return scalars
@@ -492,11 +532,20 @@ class SparseSwitchMVStrategy:
         regret_keys = {
             "regret",
             "cum_regret",
+            "return_regret",
+            "cumulative_return_regret",
+            "raw_return_gap",
+            "actual_portfolio_return",
+            "hindsight_portfolio_return",
+            "mean_abs_return_gap",
+            "regret_count",
+            "estimated_objective",
+            "hindsight_objective",
+            # Backward-compatible names from older telemetry payloads.
             "last_estimation_regret",
             "cumulative_estimation_regret",
             "positive_estimation_regret",
             "mean_abs_estimation_gap",
-            "regret_count",
             "estimated_loss",
             "observed_loss",
         }
@@ -504,7 +553,7 @@ class SparseSwitchMVStrategy:
         # For historical compatibility, `rebalance` now means: emit once at the
         # next dashboard publish after the rebalance/regret computation.
         # This is the only reliable behavior under throttled ZMQ publishing.
-        if self._last_estimation_regret is None or self._regret_count <= self._last_published_regret_count:
+        if self._last_return_regret is None or self._regret_count <= self._last_published_regret_count:
             return {k: v for k, v in scalars.items() if k not in regret_keys}
 
         self._last_published_regret_count = int(self._regret_count)
