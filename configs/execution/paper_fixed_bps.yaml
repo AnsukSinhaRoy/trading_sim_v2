@@ -2,10 +2,10 @@ execution:
   initial_cash: 1000000
   slippage:
     model: fixed_bps
-    bps: 3
+    bps: 5
   fees:
     model: fixed_bps
-    bps: 1
+    bps: 2
 
   # Liquidity-aware execution guardrails.
   # These are data-driven caps, not fixed share-count caps:
@@ -15,8 +15,8 @@ execution:
   # / low-liquidity names without banning cheap stocks outright.
   liquidity:
     enabled: true
-    max_bar_participation: 0.10
-    max_position_adv_participation: 0.10
+    max_bar_participation: 0.01
+    max_position_adv_participation: 0.05
     adv_lookback_days: 20
     min_adv_history_days: 5
     require_volume_for_buys: true
