@@ -162,6 +162,36 @@ def setup_dashboard_ui(self):
     learning_regret_layout.addWidget(self.ol_regret_plot)
     self._learning_regret_tab_index = self.tabs.addTab(learning_regret, "Online Regret")
 
+    # --- Frictions Tab ---
+    frictions = QWidget()
+    frictions_layout = QVBoxLayout(frictions)
+
+    self.frictions_summary_lbl = create_info_label(
+        "Frictions diagnostics will appear as fills and execution telemetry arrive. "
+        "This tab separates realized fees/slippage from liquidity and cash constraints before execution."
+    )
+    frictions_layout.addWidget(self.frictions_summary_lbl)
+
+    frictions_splitter = QSplitter()
+    frictions_splitter.setOrientation(Qt.Orientation.Vertical)
+
+    self.friction_cost_table = create_table(["Metric", "Value", "Notes"])
+    frictions_splitter.addWidget(self.friction_cost_table)
+
+    self.friction_config_table = create_table(["Parameter", "Value", "Meaning"])
+    frictions_splitter.addWidget(self.friction_config_table)
+
+    self.liquidity_diag_table = create_table(["Diagnostic", "Value", "Meaning"])
+    frictions_splitter.addWidget(self.liquidity_diag_table)
+
+    self.friction_symbol_table = create_table([
+        "Symbol", "Fills", "Gross Notional", "Fees", "Slippage", "Total Cost", "Cost bps"
+    ])
+    frictions_splitter.addWidget(self.friction_symbol_table)
+
+    frictions_layout.addWidget(frictions_splitter)
+    self._frictions_tab_index = self.tabs.addTab(frictions, "Frictions")
+
     # --- PnL Tab ---
     pnl = QWidget()
     pnl_layout = QVBoxLayout(pnl)

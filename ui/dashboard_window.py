@@ -11,6 +11,12 @@ import pyqtgraph as pg
 from .listener import ZmqListener
 from .dashboard_layout import setup_dashboard_ui
 from .theme import APP_QSS, COLORS
+from .frictions import (
+    make_friction_state,
+    update_friction_from_fill,
+    update_friction_from_nav,
+    render_friction_tab,
+)
 
 
 # --- Main Dashboard Window ---
@@ -77,6 +83,11 @@ class RealTimeDashboard(QMainWindow):
         self._latest_visible_symbols: List[str] = []
         self._latest_prices: Dict[str, float] = {}
         self._latest_target_weights: Dict[str, float] = {}
+
+        # Friction and liquidity diagnostics shown in the Frictions tab.
+        self._friction_state = make_friction_state()
+        self._last_friction_update = 0.0
+        self._friction_fps = 2.0
 
         # Throttles
         self._plot_fps = 2.0
@@ -219,6 +230,7 @@ class RealTimeDashboard(QMainWindow):
                     self._latest_marks[sym] = float(mark)
 
             self._render_positions(positions, pos_values)
+            update_friction_from_nav(self._friction_state, self._latest_nav)
 
             # Mark this NAV packet consumed. Without this, the UI timer would
             # duplicate the same NAV snapshot and corrupt online metrics.
@@ -247,6 +259,7 @@ class RealTimeDashboard(QMainWindow):
             # Update state
             self._update_pnl_from_fill(f)
             self._update_trade_blotter_from_fill(f)
+            update_friction_from_fill(self._friction_state, f)
 
             # Buffers for display
             self._recent_fills.append(f)
@@ -269,6 +282,10 @@ class RealTimeDashboard(QMainWindow):
         if (now - self._last_pnl_update) >= (1.0 / self._pnl_fps):
             self._last_pnl_update = now
             self._render_pnl_table()
+
+        if (now - self._last_friction_update) >= (1.0 / self._friction_fps):
+            self._last_friction_update = now
+            render_friction_tab(self)
 
     def _finite_float(self, value, default=None):
         try:

@@ -501,6 +501,15 @@ def _bar_qty_cap(sym: str, side: str, snap: MarketSnapshot, liq: LiquidityConstr
     return max(0, cap)
 
 
+def _has_missing_or_zero_bar_volume(sym: str, snap: MarketSnapshot) -> bool:
+    vol = getattr(snap, "volumes", {}) or {}
+    try:
+        bar_vol = float(vol.get(sym, 0.0))
+    except Exception:
+        bar_vol = 0.0
+    return (not math.isfinite(bar_vol)) or bar_vol <= 0.0
+
+
 def _position_qty_cap(sym: str, liq: LiquidityConstraints, tracker: Optional[LiquidityTracker]) -> Optional[int]:
     if not liq.enabled or tracker is None:
         return None
@@ -511,19 +520,125 @@ def _position_qty_cap(sym: str, liq: LiquidityConstraints, tracker: Optional[Liq
     return max(0, cap)
 
 
-def _rebalance(
+def _new_rebalance_diag(ts, liquidity: LiquidityConstraints, tracker: Optional[LiquidityTracker]) -> dict:
+    return {
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "liquidity_enabled": bool(liquidity.enabled),
+        "orders": 0,
+        "buy_orders": 0,
+        "sell_orders": 0,
+        "desired_buy_qty": 0,
+        "desired_sell_qty": 0,
+        "submitted_buy_qty": 0,
+        "submitted_sell_qty": 0,
+        "deferred_buy_qty": 0,
+        "deferred_sell_qty": 0,
+        "desired_buy_notional": 0.0,
+        "desired_sell_notional": 0.0,
+        "submitted_buy_notional": 0.0,
+        "submitted_sell_notional": 0.0,
+        "deferred_buy_notional": 0.0,
+        "deferred_sell_notional": 0.0,
+        "bar_cap_hits": 0,
+        "adv_cap_hits": 0,
+        "cash_cap_hits": 0,
+        "missing_volume_blocks": 0,
+        "symbols_bar_capped": [],
+        "symbols_adv_capped": [],
+        "symbols_cash_capped": [],
+        "symbols_missing_volume": [],
+        "volume_snapshots_seen": int(getattr(tracker, "seen_volume_snapshots", 0) or 0) if tracker is not None else 0,
+        "volume_symbols_seen": int(len(getattr(tracker, "seen_volume_symbols", set()) or set())) if tracker is not None else 0,
+    }
+
+
+def _diag_add_symbol(diag: dict, key: str, sym: str, *, limit: int = 25) -> None:
+    vals = diag.setdefault(key, [])
+    sym = str(sym)
+    if sym not in vals and len(vals) < int(limit):
+        vals.append(sym)
+
+
+def _accumulate_rebalance_diag(cum: dict, diag: Optional[dict]) -> None:
+    if not isinstance(diag, dict):
+        return
+    cum["rebalance_checks"] = int(cum.get("rebalance_checks", 0)) + 1
+    for key in (
+        "orders", "buy_orders", "sell_orders",
+        "desired_buy_qty", "desired_sell_qty", "submitted_buy_qty", "submitted_sell_qty",
+        "deferred_buy_qty", "deferred_sell_qty",
+        "bar_cap_hits", "adv_cap_hits", "cash_cap_hits", "missing_volume_blocks",
+    ):
+        cum[key] = int(cum.get(key, 0)) + int(diag.get(key, 0) or 0)
+    for key in (
+        "desired_buy_notional", "desired_sell_notional",
+        "submitted_buy_notional", "submitted_sell_notional",
+        "deferred_buy_notional", "deferred_sell_notional",
+    ):
+        cum[key] = float(cum.get(key, 0.0)) + _safe_float_for_ui(diag.get(key, 0.0))
+    for src_key, dst_key in (
+        ("symbols_bar_capped", "symbols_bar_capped"),
+        ("symbols_adv_capped", "symbols_adv_capped"),
+        ("symbols_cash_capped", "symbols_cash_capped"),
+        ("symbols_missing_volume", "symbols_missing_volume"),
+    ):
+        cur = list(cum.get(dst_key, []))
+        for sym in diag.get(src_key, []) or []:
+            if sym not in cur and len(cur) < 50:
+                cur.append(sym)
+        cum[dst_key] = cur
+
+
+def _friction_config_for_ui(cfg: Config, liquidity: LiquidityConstraints) -> dict:
+    return {
+        "initial_cash": float(cfg.get("execution", "initial_cash", default=1_000_000)),
+        "slippage_model": str(cfg.get("execution", "slippage", "model", default="fixed_bps")),
+        "slippage_bps": float(cfg.get("execution", "slippage", "bps", default=0.0)),
+        "fees_model": str(cfg.get("execution", "fees", "model", default="fixed_bps")),
+        "fees_bps": float(cfg.get("execution", "fees", "bps", default=0.0)),
+        "liquidity_enabled": bool(liquidity.enabled),
+        "max_bar_participation": float(liquidity.max_bar_participation),
+        "max_position_adv_participation": float(liquidity.max_position_adv_participation),
+        "adv_lookback_days": int(liquidity.adv_lookback_days),
+        "min_adv_history_days": int(liquidity.min_adv_history_days),
+        "require_volume_for_buys": bool(liquidity.require_volume_for_buys),
+        "apply_to_sells": bool(liquidity.apply_to_sells),
+    }
+
+
+def _frictions_payload_for_ui(
+    cfg: Config,
+    liquidity: LiquidityConstraints,
+    tracker: Optional[LiquidityTracker],
+    cumulative_diag: dict,
+    last_diag: dict,
+) -> dict:
+    return {
+        "config": _friction_config_for_ui(cfg, liquidity),
+        "liquidity": {
+            "enabled": bool(liquidity.enabled),
+            "volume_snapshots_seen": int(getattr(tracker, "seen_volume_snapshots", 0) or 0) if tracker is not None else 0,
+            "volume_symbols_seen": int(len(getattr(tracker, "seen_volume_symbols", set()) or set())) if tracker is not None else 0,
+        },
+        "last_rebalance": last_diag or {},
+        "cumulative_rebalance": cumulative_diag or {},
+    }
+
+
+def _rebalance_with_diagnostics(
     ts,
     target_w: Dict[str, float],
     snap: MarketSnapshot,
     port: PositionSnapshot,
     liquidity: Optional[LiquidityConstraints] = None,
     liquidity_tracker: Optional[LiquidityTracker] = None,
-) -> List[OrderRequest]:
+) -> tuple[List[OrderRequest], dict]:
     prices = snap.prices
     nav = float(port.nav)
     cash = float(port.cash)
     cur_pos = dict(port.positions)
     liq = liquidity or LiquidityConstraints(enabled=False)
+    diag = _new_rebalance_diag(ts, liq, liquidity_tracker)
 
     desired_notional = {sym: _clean_weight(w) * nav for sym, w in target_w.items()}
     orders: List[OrderRequest] = []
@@ -537,21 +652,41 @@ def _rebalance(
             continue
         cur_qty = int(qty)
         tgt_val = desired_notional.get(sym, 0.0)
-        desired_qty = int(math.floor(max(0.0, tgt_val) / px))
+        desired_qty_uncapped = int(math.floor(max(0.0, tgt_val) / px))
+        desired_qty = desired_qty_uncapped
 
         pos_cap = _position_qty_cap(sym, liq, liquidity_tracker)
-        if pos_cap is not None:
+        if pos_cap is not None and desired_qty > pos_cap:
             desired_qty = min(desired_qty, pos_cap)
+            diag["adv_cap_hits"] += 1
+            _diag_add_symbol(diag, "symbols_adv_capped", sym)
 
-        sell_qty = int(cur_qty - desired_qty)
-        if sell_qty <= 0:
+        requested_sell_qty = int(cur_qty - desired_qty)
+        if requested_sell_qty <= 0:
             continue
 
+        diag["desired_sell_qty"] += requested_sell_qty
+        diag["desired_sell_notional"] += requested_sell_qty * px
+
+        sell_qty = requested_sell_qty
         bar_cap = _bar_qty_cap(sym, "SELL", snap, liq)
-        if bar_cap is not None:
+        if bar_cap is not None and sell_qty > bar_cap:
+            diag["bar_cap_hits"] += 1
+            _diag_add_symbol(diag, "symbols_bar_capped", sym)
+            if bar_cap == 0 and _has_missing_or_zero_bar_volume(sym, snap):
+                diag["missing_volume_blocks"] += 1
+                _diag_add_symbol(diag, "symbols_missing_volume", sym)
             sell_qty = min(sell_qty, bar_cap)
+
+        deferred = max(0, requested_sell_qty - sell_qty)
+        diag["deferred_sell_qty"] += deferred
+        diag["deferred_sell_notional"] += deferred * px
+
         if sell_qty > 0:
             orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="SELL", qty=sell_qty))
+            diag["sell_orders"] += 1
+            diag["submitted_sell_qty"] += sell_qty
+            diag["submitted_sell_notional"] += sell_qty * px
 
     # Buy logic. The optimizer may ask for a target weight, but the execution
     # layer only moves toward that target at a realistic participation rate and
@@ -563,27 +698,71 @@ def _rebalance(
             continue
         qty = int(cur_pos.get(sym, 0))
         tgt_val = desired_notional.get(sym, 0.0)
-        desired_qty = int(math.floor(max(0.0, tgt_val) / px))
+        desired_qty_uncapped = int(math.floor(max(0.0, tgt_val) / px))
+        desired_qty = desired_qty_uncapped
 
         pos_cap = _position_qty_cap(sym, liq, liquidity_tracker)
-        if pos_cap is not None:
+        if pos_cap is not None and desired_qty > pos_cap:
             desired_qty = min(desired_qty, pos_cap)
+            diag["adv_cap_hits"] += 1
+            _diag_add_symbol(diag, "symbols_adv_capped", sym)
 
-        buy_qty = int(desired_qty - qty)
-        if buy_qty <= 0:
+        requested_buy_qty = int(desired_qty - qty)
+        if requested_buy_qty <= 0:
             continue
 
+        diag["desired_buy_qty"] += requested_buy_qty
+        diag["desired_buy_notional"] += requested_buy_qty * px
+
+        buy_qty = requested_buy_qty
         bar_cap = _bar_qty_cap(sym, "BUY", snap, liq)
-        if bar_cap is not None:
+        if bar_cap is not None and buy_qty > bar_cap:
+            diag["bar_cap_hits"] += 1
+            _diag_add_symbol(diag, "symbols_bar_capped", sym)
+            if bar_cap == 0 and _has_missing_or_zero_bar_volume(sym, snap):
+                diag["missing_volume_blocks"] += 1
+                _diag_add_symbol(diag, "symbols_missing_volume", sym)
             buy_qty = min(buy_qty, bar_cap)
 
         affordable_qty = int(math.floor(remaining / px))
-        buy_qty = min(buy_qty, affordable_qty)
+        if buy_qty > affordable_qty:
+            diag["cash_cap_hits"] += 1
+            _diag_add_symbol(diag, "symbols_cash_capped", sym)
+            buy_qty = min(buy_qty, affordable_qty)
+
+        deferred = max(0, requested_buy_qty - buy_qty)
+        diag["deferred_buy_qty"] += deferred
+        diag["deferred_buy_notional"] += deferred * px
+
         if buy_qty > 0:
             orders.append(OrderRequest(ts=ts, order_id=str(uuid.uuid4()), symbol=sym, side="BUY", qty=buy_qty))
+            diag["buy_orders"] += 1
+            diag["submitted_buy_qty"] += buy_qty
+            diag["submitted_buy_notional"] += buy_qty * px
             remaining -= buy_qty * px
 
+    diag["orders"] = len(orders)
+    return orders, diag
+
+
+def _rebalance(
+    ts,
+    target_w: Dict[str, float],
+    snap: MarketSnapshot,
+    port: PositionSnapshot,
+    liquidity: Optional[LiquidityConstraints] = None,
+    liquidity_tracker: Optional[LiquidityTracker] = None,
+) -> List[OrderRequest]:
+    orders, _ = _rebalance_with_diagnostics(
+        ts,
+        target_w,
+        snap,
+        port,
+        liquidity=liquidity,
+        liquidity_tracker=liquidity_tracker,
+    )
     return orders
+
 
 # --- Core Event Engine ---
 
@@ -613,6 +792,11 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
             liquidity_constraints.adv_lookback_days,
             liquidity_constraints.min_adv_history_days,
         )
+
+    # Friction/liquidity diagnostics are UI telemetry only. They do not change
+    # order generation, execution prices, or portfolio accounting.
+    cumulative_rebalance_diag: dict = {}
+    last_rebalance_diag: dict = {}
     
     # Initialize ZMQ Publisher (for Qt Dashboard)
     zmq_host = str(cfg.get("ui", "zmq_host", default="127.0.0.1"))
@@ -645,6 +829,9 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
         "visible_symbols": [],
         "prices": {},
         "target_weights": {},
+        "frictions": _frictions_payload_for_ui(
+            cfg, liquidity_constraints, liquidity_tracker, cumulative_rebalance_diag, last_rebalance_diag
+        ),
     })
     await pub.publish("learn", {
         "ts": port.ts.isoformat(),
@@ -724,7 +911,7 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                 orders: List[OrderRequest] = []
                 target_w = getattr(strat, "_last_target_weights", None)
                 if isinstance(target_w, dict) and target_w:
-                    orders = _rebalance(
+                    orders, last_rebalance_diag = _rebalance_with_diagnostics(
                         event.ts,
                         target_w,
                         event,
@@ -732,6 +919,7 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                         liquidity=liquidity_constraints,
                         liquidity_tracker=liquidity_tracker,
                     )
+                    _accumulate_rebalance_diag(cumulative_rebalance_diag, last_rebalance_diag)
                     
                     if orders:
                         logger.append_many(orders)
@@ -803,6 +991,9 @@ async def run_stream(cfg: Config, run_dir: Path, logger: EventLogger, logger_obj
                         "visible_symbols": visible_symbols,
                         "prices": prices_for_ui,
                         "target_weights": target_weights_for_ui,
+                        "frictions": _frictions_payload_for_ui(
+                            cfg, liquidity_constraints, liquidity_tracker, cumulative_rebalance_diag, last_rebalance_diag
+                        ),
                     })
                     await pub.publish("learn", _extract_strategy_telemetry(strat, event, port, tick_count))
                 if log and (tick_count % int(cfg.get("run","progress_every_ticks", default=250)) == 0):
