@@ -1,30 +1,29 @@
-# `configs` — Modular YAML configuration
+# `configs` — sparse-only YAML configuration
 
 ## Layout
-- `run/` : top-level run YAMLs (choose modules + run metadata)
-- `market_feed/` : feed configs
-- `strategy/` : strategy params
-- `execution/` : execution/slippage params
-- `ui/` : UI/ZMQ publish settings
-- `preprocess/` : preprocessing pipeline configs
+
+- `run/`: top-level run YAMLs.
+- `market_feed/`: feed configs.
+- `strategy/`: sparse switching mean-variance parameters.
+- `execution/`: paper execution, slippage, fee, and liquidity settings.
+- `ui/`: ZMQ publish settings for the PyQt dashboard.
+- `preprocess/`: data-preprocessing pipeline configs.
 
 ## How merging works
-A run YAML contains:
+
+A run YAML references module YAMLs:
 
 ```yaml
 run:
-  name: demo
+  name: demo_synth_sparse_switch_mv
 modules:
   market_feed: ../market_feed/synth_1m.yaml
   execution:   ../execution/paper_fixed_bps.yaml
-  strategy:    ../strategy/toy_rebalance.yaml
+  strategy:    ../strategy/sparse_switch_mv.yaml
   ui:          ../ui/qt_dashboard.yaml
 ```
 
-`runner.config.Config.load()` loads the run file and deep-merges each referenced module YAML
-into a single dictionary.
+`runner.config.Config.load()` loads the run YAML, resolves the relative module
+paths, and deep-merges the module files into one runtime config.
 
-## Design choices (and why)
-- **Separation by concern**: you can swap strategy without touching feed/execution configs.
-- **Relative module paths**: configs remain portable when moved as a folder.
-- **Deep merge**: override only what you need (defaults + small diffs).
+Only `strategy.type: sparse_switch_mv` is supported in this refactor.

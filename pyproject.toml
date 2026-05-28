@@ -33,5 +33,5 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["common*", "runner*", "market_feed*", "execution*", "strategy*", "analytics*", "preprocess*"]
-exclude = ["configs*", "ui*", "runs*"]
+include = ["common*", "runner*", "market_feed*", "execution*", "strategy*", "analytics*", "preprocess*", "ui*"]
+exclude = ["configs*", "runs*"]

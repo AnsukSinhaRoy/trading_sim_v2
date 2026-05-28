@@ -1,172 +1,120 @@
-# Levitate Trading Stack (config-driven, modular)
+# Levitate Trading Stack — sparse-only refactor
 
-This repo is a **config-driven trading simulation/backtest scaffold** built around a simple principle:
+This repository is an event-driven portfolio simulator focused on one strategy
+path: **Sparse Switching Mean-Variance**. The uploaded project already had many
+experimental strategy branches; this refactor removes those branches and keeps the
+simulator readable around the sparse optimizer, paper execution, market feeds,
+analytics, and the latest PyQt dashboard.
 
-> **Events are the source of truth.** Everything else (NAV series, fills tables, positions, dashboards) is derived from the event log.
+The core design rule remains:
 
+> Events are the source of truth. Runtime state, dashboard views, NAV series,
+> fills, positions, and analytics are derived from the event stream.
 
-## Simulator realism and research features
+## What is still included
 
-This project is more than a vectorized backtest. It includes an event-sourced simulation loop, append-only JSONL event logs, whole-share paper execution, slippage/fees, volume-aware liquidity constraints, rolling ADV position caps, live PyQt monitoring, online backtest metrics, online-learning telemetry, and NAV spike forensics.
+- Synthetic, folder-based, matrix-store, and sanitized matrix-store market feeds.
+- Whole-share paper execution with fixed-bps slippage and fees.
+- Volume-aware liquidity constraints and rolling ADV position caps.
+- Sparse switching mean-variance strategy with support selection, restricted
+  simplex optimization, and telemetry-only hindsight-return regret.
+- Real-time PyQt dashboard over ZMQ, preserving the latest uploaded UI features:
+  NAV controls, chart-type controls, asset analyser, return distribution,
+  online regret, frictions, positions, PnL, fills, and trades.
+- Event logging and derived analytics utilities.
+- Preprocessing utilities for cube-store data.
 
-See [`docs/SIMULATOR_FEATURES.md`](docs/SIMULATOR_FEATURES.md) for the full feature inventory and technical positioning.
+## What was removed
 
-## High-level architecture
+Removed strategy paths that are no longer part of the simulator objective:
 
+- toy rebalance
+- EMA long
+- cross-sectional momentum variants
+- RL agent
+- sparse Sortino experiment
+- old patch zip files, notebooks, caches, build artifacts, and stale UI modules
+
+## Project layout
+
+```text
+common/        Event models and JSONL event logger
+market_feed/   Synthetic, folder, matrix, and sanitized matrix feeds
+execution/     Paper execution, slippage, and portfolio accounting
+strategy/      Sparse switching mean-variance strategy only
+runner/        CLI, config loading, engine loop, factories, rebalancing, telemetry
+analytics/     Post-run derived artifacts and NAV-spike audit tools
+preprocess/    Data preprocessing and anomaly repair utilities
+ui/            PyQt dashboard and small UI support modules
+configs/       Sparse-only run/config YAMLs
 ```
-+-------------+     +------------+     +------------+     +-----------+
-| market_feed | --> | strategy   | --> | execution  | --> | eventlog   |
-+-------------+     +------------+     +------------+     +-----------+
-                                                            |
-                                                            v
-                                                   +------------------+
-                                                   | analytics + UI    |
-                                                   +------------------+
-```
-
-- **market_feed** produces aligned multi-asset snapshots (e.g., 1-minute bars).
-- **strategy** reads snapshots + positions and emits target orders.
-- **execution** turns orders into fills (with slippage/fees) and updates positions.
-- **eventlog** persists everything as append-only JSONL.
-- **analytics** derives Parquet tables from the event stream.
-- **UI** can subscribe to live ZMQ events for real-time monitoring.
-
-Each package has its own README (see `*/README.md`) describing internal architecture and design rationale.
-
-## Config-driven runs
-
-You run using a **run YAML** that references module YAMLs:
-
-- Example: `configs/run/demo_synth.yaml`
-  - points to:
-    - `configs/market_feed/synth_1m.yaml`
-    - `configs/execution/paper_fixed_bps.yaml`
-    - `configs/strategy/toy_rebalance.yaml`
-    - `configs/ui/qt_dashboard.yaml`
-
-The loader deep-merges these YAMLs into one config object.
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python -m runner.run --config configs/run/demo_synth.yaml
+python -m runner configs/run/demo_synth.yaml
 ```
 
-This creates:
-
-```
-runs/<run_id>/
-  events.jsonl
-  derived/
-    nav.parquet
-    fills.parquet
-    positions.parquet
-    trades_open.parquet
-    trades_closed.parquet
-```
-
-## One-command CLI: `levitate`
-
-Install in editable mode so the `levitate` command is available:
+or install the CLI:
 
 ```bash
 pip install -e .
-```
-
-Run any experiment with:
-
-```bash
 levitate configs/run/demo_synth.yaml
 ```
 
-Optional overrides:
+For the NIFTY cube-store sparse run:
 
 ```bash
-levitate configs/run/demo_synth.yaml --name myrun --out-dir runs
+python -m runner configs/run/cube_demo_sparse_switch_mv.yaml
 ```
 
-You can also run via Python module (works without installing scripts):
+## PyQt dashboard
 
-```bash
-python -m runner --config configs/run/demo_synth.yaml
-# or
-python -m runner configs/run/cube_demo.yaml
-```
-
-## Qt real-time dashboard (ZMQ)
-
-The engine can publish live NAV + fills over ZMQ for a lightweight desktop dashboard.
-
-### Install optional UI deps
-
-Choose one:
+Install UI dependencies:
 
 ```bash
 pip install -r requirements-ui.txt
 ```
 
-or:
-
-```bash
-pip install -e ".[ui]"
-```
-
-### Start the dashboard
+Start the dashboard:
 
 ```bash
 python ui/qt_dashboard.py --url tcp://127.0.0.1:5555
 ```
 
-### Run an experiment
+Then run an experiment. To use a different ZMQ port:
 
 ```bash
-python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml
-python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop_v2.yaml --zmq-port 5560
-python -m runner configs/run/cube_demo_xs_mom_vol_ema_stop.yaml --zmq-host 127.0.0.1 --zmq-port 5560
-```
-
-### For setting the updates and FPS of the terminal:
-ui/qt_dashboard.py : self._plot_fps = 2.0
-
-configs/ui/qt_dashboard.yaml : publish_every_ticks: 376 : higher for faster simulation and the minimum is limited by your system capabilities.
-
-### Tuning for fast backtests
-
-If the run is very fast, the UI may look frozen because the engine produces ticks faster than Qt can draw.
-
-Tune:
-
-- `ui.publish_every_ticks` (in `configs/ui/qt_dashboard.yaml`)
-
-## Data ingestion (folder of per-symbol 1m CSV)
-
-1) Put per-symbol files into a folder (example):
-   - `data/RELIANCE.csv`, `data/TCS.csv`, ...
-
-2) Edit `configs/market_feed/folder_csv_1m.yaml`:
-   - set `data_dir`
-   - set `symbols` (or use autodiscover configs)
-   - set `timestamp_col` / `price_col`
-   - set `start` and `end` (small slice first)
-
-3) Run:
-
-```bash
-levitate configs/run/demo_folder_csv.yaml
-```
-
-## Smoke tests
-
-```bash
-pytest -q
-```
-
-
-CLI override example:
-```bash
+python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
 python -m runner configs/run/cube_demo_sparse_switch_mv.yaml --zmq-port 5560
 ```
-```bashbash
-python ui/qt_dashboard.py --url tcp://127.0.0.1:5560
+
+The dashboard reads live `nav`, `fill`, and `learn` topics. If the backtest is
+faster than Qt can draw, increase `ui.publish_every_ticks` in
+`configs/ui/qt_dashboard.yaml`.
+
+## Config files
+
+The active run configs are:
+
+```text
+configs/run/demo_synth.yaml
+configs/run/cube_demo_sparse_switch_mv.yaml
 ```
+
+The active strategy config is:
+
+```text
+configs/strategy/sparse_switch_mv.yaml
+```
+
+## Tests
+
+```bash
+PYTHONPATH=. pytest -q
+```
+
+A small smoke run can be created by overriding the synthetic feed to a short
+number of minutes; the default synthetic config is intentionally long because it
+was inherited from the uploaded project.

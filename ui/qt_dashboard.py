@@ -1,253 +1,40 @@
 import sys
 import argparse
-import zmq
-import json
+from pathlib import Path
 import time
 import math
 import bisect
 from collections import deque
 from typing import Dict, List
 
+
+# Allow both `python ui/qt_dashboard.py` and `python -m ui.qt_dashboard`.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ui.axis import DenseTimeAxis
+from ui.listener import ZmqListener
+from ui.widgets import FullWidthTabBar, GuardedViewBox, SmartTableItem
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
     QWidget, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QTabBar, QSplitter,
     QLineEdit, QPushButton, QAbstractItemView, QComboBox
 )
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QSize
+from PyQt6.QtCore import QTimer, Qt, QSize
 import pyqtgraph as pg
 from datetime import datetime
 
 
 # --- Custom axis: dense (no gaps for missing days) ---
-class DenseTimeAxis(pg.AxisItem):
-    """Axis that treats x as an integer index and renders the corresponding
-    timestamp label from a backing list. This avoids weekend/holiday gaps
-    when plotting sparse trading timestamps.
-    """
-
-    def __init__(self, get_dt, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._get_dt = get_dt
-
-    def tickStrings(self, values, scale, spacing):
-        out = []
-        for v in values:
-            i = int(round(v))
-            dt = None
-            try:
-                dt = self._get_dt(i)
-            except Exception:
-                dt = None
-            if dt is None:
-                out.append('')
-            else:
-                out.append(dt.strftime('%Y-%m-%d\n%H:%M'))
-        return out
-
-class GuardedViewBox(pg.ViewBox):
-    """ViewBox that blocks accidental wheel zooms.
-
-    Normal mouse-wheel events are ignored so scrolling does not unexpectedly
-    zoom a chart. Hold Ctrl while using the wheel when you deliberately want
-    to zoom a plot.
-    """
-
-    def wheelEvent(self, ev, axis=None):
-        modifiers = QApplication.keyboardModifiers()
-        if not (modifiers & Qt.KeyboardModifier.ControlModifier):
-            ev.ignore()
-            return
-        super().wheelEvent(ev, axis=axis)
-
-    def mouseDoubleClickEvent(self, ev):
-        try:
-            self.autoRange()
-            ev.accept()
-            return
-        except Exception:
-            pass
-        super().mouseDoubleClickEvent(ev)
 
 
-class SmartTableItem(QTableWidgetItem):
-    """QTableWidgetItem with optional numeric/date-aware sort key.
-
-    This keeps cell text left-aligned and human-readable while allowing the
-    Positions header click to sort numbers as numbers rather than strings.
-    """
-
-    def __init__(self, text, sort_value=None):
-        super().__init__(str(text))
-        self.sort_value = sort_value
-
-    def __lt__(self, other):
-        a = getattr(self, "sort_value", None)
-        b = getattr(other, "sort_value", None)
-        if a is not None and b is not None:
-            try:
-                return a < b
-            except Exception:
-                pass
-        return self.text().lower() < other.text().lower()
 
 
-class FullWidthTabBar(QTabBar):
-    """Tab bar with equal-width tabs spanning the available dashboard width.
 
-    Qt often calculates tab sizes before the top-level window has its final
-    width, so the first paint can look compact and only fix itself after a
-    click/resize. The dashboard calls ``set_available_width`` after show/resize
-    so the first render gets the real width instead of the early placeholder.
-    """
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._available_width = 0
-
-    def set_available_width(self, width: int) -> None:
-        width = max(0, int(width or 0))
-        if abs(width - self._available_width) <= 1:
-            return
-        self._available_width = width
-        try:
-            self.setFixedWidth(width)
-            self.updateGeometry()
-            self.update()
-        except Exception:
-            pass
-
-    def tabSizeHint(self, index):
-        size = super().tabSizeHint(index)
-        count = max(1, self.count())
-        parent = self.parentWidget()
-        available = self._available_width or (parent.width() if parent is not None else self.width())
-        if available <= 0:
-            available = max(size.width() * count, 900)
-        width = max(74, int(available / count) - 1)
-        size.setWidth(width)
-        size.setHeight(max(size.height(), 42))
-        return size
-
-    def minimumTabSizeHint(self, index):
-        return self.tabSizeHint(index)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        try:
-            self.updateGeometry()
-        except Exception:
-            pass
 
 
 # --- Background Listener Thread ---
-class ZmqListener(QThread):
-    """Receives ZMQ messages on a background thread.
-
-    Key constraints for the dashboard:
-    - Qt GUI thread must stay responsive.
-    - In fast backtests, per-message Qt signals can overwhelm the event queue.
-
-    Strategy:
-    - Drain the SUB socket quickly.
-    - Keep only the latest NAV per drain cycle.
-    - Batch FILL messages and emit them in chunks.
-    """
-
-    nav_signal = pyqtSignal(dict)
-    fills_signal = pyqtSignal(list)
-    learn_signal = pyqtSignal(dict)
-
-    def __init__(self, url: str, *, max_fills_emit: int = 2000, poll_ms: int = 50, max_drain_ms: int = 15):
-        super().__init__()
-        self.url = url
-        self._running = True
-        self._max_fills_emit = int(max(1, max_fills_emit))
-        self._poll_ms = int(max(1, poll_ms))
-        self._max_drain_s = float(max(1, max_drain_ms)) / 1000.0
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        ctx = zmq.Context.instance()
-
-        sock = ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.setsockopt(zmq.RCVHWM, 10000)
-        sock.connect(self.url)
-        sock.setsockopt_string(zmq.SUBSCRIBE, "nav")
-        sock.setsockopt_string(zmq.SUBSCRIBE, "fill")
-        sock.setsockopt_string(zmq.SUBSCRIBE, "learn")
-
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-
-        latest_nav = None
-        latest_learn = None
-        fills_batch: List[dict] = []
-
-        def _decode(msg_b: bytes):
-            try:
-                return json.loads(msg_b.decode("utf-8"))
-            except Exception as e:
-                print(f"ZMQ decode error: {e}")
-                return None
-
-        def _flush():
-            nonlocal latest_nav, latest_learn, fills_batch
-            if latest_nav is not None:
-                self.nav_signal.emit(latest_nav)
-                latest_nav = None
-            if latest_learn is not None:
-                self.learn_signal.emit(latest_learn)
-                latest_learn = None
-            if fills_batch:
-                # Emit in chunks to avoid huge cross-thread payloads.
-                n = len(fills_batch)
-                if n <= self._max_fills_emit:
-                    self.fills_signal.emit(fills_batch)
-                else:
-                    for i in range(0, n, self._max_fills_emit):
-                        self.fills_signal.emit(fills_batch[i:i + self._max_fills_emit])
-                fills_batch = []
-
-        try:
-            while self._running:
-                events = dict(poller.poll(self._poll_ms))
-
-                # Even if no new events, flush pending batches (rare).
-                if sock not in events:
-                    _flush()
-                    continue
-
-                # Drain all available messages quickly, but time-bound.
-                start = time.perf_counter()
-                while True:
-                    if (time.perf_counter() - start) >= self._max_drain_s:
-                        break
-                    try:
-                        topic_b, msg_b = sock.recv_multipart(flags=zmq.NOBLOCK)
-                    except zmq.Again:
-                        break
-
-                    data = _decode(msg_b)
-                    if data is None:
-                        continue
-
-                    topic = topic_b.decode("utf-8", errors="ignore")
-                    if topic == "nav":
-                        latest_nav = data
-                    elif topic == "fill":
-                        fills_batch.append(data)
-                    elif topic == "learn":
-                        latest_learn = data
-
-                _flush()
-        finally:
-            try:
-                sock.close(0)
-            except Exception:
-                pass
 
 
 # --- Main Dashboard Window ---

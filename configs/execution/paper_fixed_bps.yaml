@@ -15,8 +15,8 @@ execution:
   # / low-liquidity names without banning cheap stocks outright.
   liquidity:
     enabled: true
-    max_bar_participation: 0.01
-    max_position_adv_participation: 0.05
+    max_bar_participation: 0.001
+    max_position_adv_participation: 0.005
     adv_lookback_days: 20
     min_adv_history_days: 5
     require_volume_for_buys: true

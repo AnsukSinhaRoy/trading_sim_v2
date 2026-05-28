@@ -1,38 +1,29 @@
-# `runner` — Config loader, engine loop, CLI
+# `runner` — config loader, engine loop, CLI
 
-## What lives here
-- `config.py`: YAML loader + deep-merge for modular configs.
-- `engine.py`: the simulation loop (feed → strategy → execution → events).
-- `cli.py` / `run.py`: entrypoints (`levitate ...` and `python -m runner ...`).
-- `logging_utils.py`: structured run logging into `runs/<run_id>/run.log`.
+The runner package owns the runtime loop and the small factories that build feed,
+execution, strategy, liquidity, and telemetry components.
 
-## Architecture
-The engine is deliberately small and explicit:
+## Files
 
-1. Load a **run YAML** (e.g. `configs/run/demo_synth.yaml`)
-2. Merge referenced module YAMLs into one config.
-3. Instantiate:
-   - market feed (snapshot generator)
-   - strategy (order generator)
-   - execution (fill simulator + portfolio bookkeeping)
-4. For each tick:
-   - read snapshot
-   - ask strategy for orders
-   - execute orders → fills
-   - update portfolio → position snapshot
-   - emit events to `events.jsonl`
-   - (optional) publish live events over **ZMQ** for the Qt dashboard
+- `config.py`: YAML loader and deep-merge logic.
+- `run.py`: creates the run folder, logging, effective config, and event logger.
+- `cli.py`: `levitate ...` command and preprocess/run dispatch.
+- `engine.py`: compact event loop.
+- `factories.py`: feed, execution, and sparse-strategy construction.
+- `liquidity.py`: bar-volume and ADV-based execution constraints.
+- `rebalancer.py`: target-weight to order conversion with diagnostics.
+- `publisher.py`: best-effort ZMQ publisher for the dashboard.
+- `telemetry.py`: strategy telemetry extraction for the `learn` topic.
 
-## Design choices (and why)
-- **Deep-merged modular YAMLs**: keeps configs readable and prevents “one giant config file”.
-- **Event-sourced loop**: makes runs replayable and derived artifacts regeneratable.
-- **ZMQ PUB/SUB for UI**: decouples UI from engine runtime and avoids tight coupling to disk.
+## Event-loop flow
 
-## Key runtime knobs
-- `ui.publish_every_ticks`: reduces UI pressure in fast backtests by publishing less frequently.
-- Feed speed controls (for “real-time-ish” playback vs max-throughput backtests).
+1. Build feed, paper execution, sparse strategy, and liquidity tracker.
+2. Stream market snapshots.
+3. Mark the paper portfolio to market.
+4. Let the strategy update target weights.
+5. Rebalance toward target weights with cash and liquidity constraints.
+6. Execute orders, log events, and publish dashboard packets.
 
-## Extension points
-- Add new strategies by dropping a module/package under `strategy/` and setting `strategy.type` in YAML.
-  No engine edits are required; the loader resolves strategies by convention (or `module:Class` for explicit paths).
-- Add new execution models (e.g., latency, queueing, partial fills).
+The strategy factory is intentionally sparse-only. Adding dynamic auto-discovery
+again would make the code more clever but less readable, and it would contradict
+the current simulator scope.

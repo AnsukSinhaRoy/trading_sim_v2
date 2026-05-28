@@ -1,10 +1,10 @@
 run:
-  name: demo_synth
+  name: demo_synth_sparse_switch_mv
   out_dir: runs
   seed: 7
 
 modules:
   market_feed: ../market_feed/synth_1m.yaml
   execution:   ../execution/paper_fixed_bps.yaml
-  strategy:    ../strategy/xs_mom_vol_ema_stop.yaml
+  strategy:    ../strategy/sparse_switch_mv.yaml
   ui:          ../ui/qt_dashboard.yaml

@@ -1,7 +1,0 @@
-analytics
-common
-execution
-market_feed
-preprocess
-runner
-strategy
